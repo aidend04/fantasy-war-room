@@ -1,7 +1,7 @@
 # War Room — Sleeper fantasy football panel
 
 A local dashboard for drafting and managing a Sleeper league using public data only
-(Sleeper API, Sleeper/Rotowire projections, Fantasy Football Calculator ADP).
+(Sleeper API, Sleeper/Rotowire and ESPN projections, Fantasy Football Calculator ADP).
 No API keys, no logins, no dependencies beyond Python 3.
 
 ## Run
@@ -28,6 +28,22 @@ Your username and league are remembered in the browser.
 
 ## How the numbers are built
 
+- **Consensus projections**: Sleeper/Rotowire and ESPN weekly stat lines are both scored with your league's
+  settings and averaged (equal weights until enough weeks are graded, then inverse-MSE weights from the
+  accuracy log). A ± chip marks players where the sources differ by 30%+ this week.
+- **Accuracy log**: every load freezes the current projections for unfinished weeks in `warroom.db`; once
+  a week's games are complete the actual points are pulled and each source is graded per position.
+- **Season simulation**: 1,500 Monte Carlo seasons over the remaining schedule (real matchups once Sleeper
+  publishes them, random pairings before that), weekly team scores drawn around each team's best-lineup
+  projection, standings by wins then points, bracket from the league's playoff settings (6-team byes and
+  reseeding handled; league-median games counted when enabled). Trade and waiver "what ifs" re-run it with
+  the same random numbers so the deltas are stable.
+- **FAAB model**: every waiver bid (won and lost) in the league and its two previous seasons, each tagged
+  with the target's positional rank by projection that week. Suggested bids are the median and 75th
+  percentile of winning bids for comparable targets in the same part of the season.
+- **Trade finder**: team value = best lineup on the chosen basis + 35% of top-four bench VORP; offers are
+  kept when your gain is 4+ and theirs is at least −3, ranked by your gain plus half of theirs.
+
 - **Points** are recomputed from projected stat lines using the league's own `scoring_settings`, so
   TE premium, 6-pt passing TDs, bonuses, etc. are all respected. Without a league it uses the Scoring selector (half PPR by default).
 - **VORP**: every league-wide starting slot (fixed then flex/superflex) is filled with the best available
@@ -47,5 +63,22 @@ Your username and league are remembered in the browser.
 - **No league loaded**: the Scoring selector (default half PPR) drives points and ADP format.
 - **Rest of season** = sum of Sleeper weekly projections from the selected week through week 18.
 - **ADP format** auto-selects 2QB for superflex leagues, else PPR / half / standard from the `rec` setting.
+
+## Game-day alerts from cron
+
+`alerts.py` checks your starters without the browser: injury status, byes, low projections and the best
+bench swap. It exits 1 when something needs attention.
+
+```bash
+python3 alerts.py --user YOUR_SLEEPER_NAME --notify
+```
+
+Add `--webhook https://discord.com/api/webhooks/...` to post to Discord (Slack-style `text` is sent too).
+Example crontab (Thursday 6pm, Sunday 9am and 12:30pm Eastern):
+
+```
+0 18 * * 4  cd /path/to/fantasy-war-room && python3 alerts.py --user YOUR_NAME --notify
+0 9,12 * * 0 cd /path/to/fantasy-war-room && python3 alerts.py --user YOUR_NAME --notify
+```
 
 Data is cached in `.cache/` (players 6 h, season projections 1 h, weekly 15 min, draft picks 5 s).
