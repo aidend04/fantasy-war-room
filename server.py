@@ -499,7 +499,7 @@ ESPN_ABBR = {"WSH": "WAS"}
 def espn_progress(season, week):
     """{team: {state, progress}} from ESPN's public scoreboard: progress = fraction of game time elapsed."""
     try:
-        d = fetch_json("https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week=%s&seasontype=2&year=%s" % (week, season), ttl=45)
+        d = fetch_json("https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week=%s&seasontype=2&year=%s" % (week, season), ttl=45)
     except Exception:
         return {}
     out = {}
@@ -519,10 +519,23 @@ def espn_progress(season, week):
             prog = min(0.99, max(0.0, ((period - 1) * 15 + (15 - left)) / 60.0)) if period <= 4 else 0.97
         else:
             prog = 0.0
+        odds = None
+        o = (c.get("odds") or [None])[0]
+        if o and o.get("overUnder"):
+            ou = float(o["overUnder"]); det = o.get("details") or ""
+            parts = det.split()
+            fav = ESPN_ABBR.get(parts[0], parts[0]) if len(parts) == 2 else None
+            try:
+                sp = abs(float(parts[1])) if len(parts) == 2 else 0.0
+            except ValueError:
+                sp = 0.0
+            teams = [ESPN_ABBR.get((x.get("team") or {}).get("abbreviation"), (x.get("team") or {}).get("abbreviation")) for x in c.get("competitors", [])]
+            implied = {t: round((ou + sp) / 2 if t == fav else (ou - sp) / 2 if fav else ou / 2, 1) for t in teams}
+            odds = {"fav": fav, "spread": sp, "ou": ou, "implied": implied, "details": det}
         for comp in c.get("competitors", []):
             ab = (comp.get("team") or {}).get("abbreviation")
             if ab:
-                out[ESPN_ABBR.get(ab, ab)] = {"state": state, "progress": round(prog, 3), "detail": (st.get("type") or {}).get("shortDetail")}
+                out[ESPN_ABBR.get(ab, ab)] = {"state": state, "progress": round(prog, 3), "detail": (st.get("type") or {}).get("shortDetail"), "odds": odds, "kickoff": ev.get("date")}
     return out
 
 
@@ -536,7 +549,7 @@ def games(season, week):
         e = prog.get(g["home"]) or prog.get(g["away"]) or {}
         g = dict(g)
         g["progress"] = e.get("progress", 1.0 if g.get("status") == "complete" else 0.0)
-        g["detail"] = e.get("detail")
+        g["detail"] = e.get("detail"); g["odds"] = e.get("odds"); g["kickoff"] = e.get("kickoff")
         if e.get("state") == "in":
             g["status"] = "in_game"
         elif e.get("state") == "post":
@@ -570,6 +583,127 @@ def volatility(season):
             by_pos.setdefault(pos, []).append(cv)
     med = {pos: sorted(v)[len(v) // 2] for pos, v in by_pos.items() if v}
     return {"season": season, "players": out, "pos_cv": med}
+
+
+def news(limit=100):
+    """Latest ESPN NFL headlines with the Sleeper ids of athletes ESPN tagged (when it tagged any)."""
+    d = fetch_json("https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/news?limit=%d" % limit, ttl=600)
+    idx = espn_index()["espn"]
+    out = []
+    for a in d.get("articles", []):
+        ath = [idx.get(str(c.get("athleteId"))) for c in a.get("categories", []) if c.get("type") == "athlete"]
+        out.append({"headline": a.get("headline"), "description": a.get("description"), "published": a.get("published"),
+                    "link": ((a.get("links") or {}).get("web") or {}).get("href"), "athletes": [x for x in ath if x]})
+    return {"articles": out}
+
+
+def weekly_stats(season, week, ttl=None):
+    q = "season_type=regular&" + "&".join("position[]=" + p for p in POSITIONS)
+    return fetch_json("https://api.sleeper.com/stats/nfl/%s/%s?%s" % (season, week, q), ttl=ttl or (7 * 86400 if week < 18 else 86400), disk=True)
+
+
+def usage(season, through):
+    """Per-player weekly usage: targets, carries, snaps, snap share, points; for trend detection."""
+    through = int(through)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        weeks = list(ex.map(lambda w: (w, weekly_stats(season, w, ttl=3600 if w == through else None)), range(1, through + 1)))
+    out = {}
+    for w, rows in weeks:
+        for r in rows:
+            s = r.get("stats") or {}
+            if not s.get("gp") and not s.get("off_snp"):
+                continue
+            snp, tm = s.get("off_snp"), s.get("tm_off_snp")
+            out.setdefault(r["player_id"], {})[str(w)] = {"tgt": s.get("rec_tgt") or 0, "att": s.get("rush_att") or 0, "pa": s.get("pass_att") or 0,
+                                                          "snp": snp or 0, "pct": round(snp / tm, 3) if snp and tm else None, "pts": s.get("pts_ppr") or 0, "opp": r.get("opponent")}
+    return {"season": season, "through": through, "players": out}
+
+
+def dvp(season, through):
+    """Fantasy points allowed by each defense to each position, per game, with ranks (1 = toughest)."""
+    through = int(through)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        weeks = list(ex.map(lambda w: weekly_stats(season, w), range(1, through + 1)))
+    players = players_trimmed()
+    allowed, games = {}, {}
+    for rows in weeks:
+        seen = set()
+        for r in rows:
+            s = r.get("stats") or {}
+            opp, pos = r.get("opponent"), (players.get(r["player_id"]) or {}).get("pos")
+            if not opp or pos not in ("QB", "RB", "WR", "TE", "K") or not s.get("pts_ppr"):
+                continue
+            allowed.setdefault(opp, {}).setdefault(pos, 0.0)
+            allowed[opp][pos] += s["pts_ppr"]
+            if (opp, pos) not in seen:
+                games.setdefault(opp, {}).setdefault(pos, 0)
+                games[opp][pos] += 1; seen.add((opp, pos))
+    out = {}
+    for team, per in allowed.items():
+        out[team] = {pos: {"avg": round(v / max(1, games[team][pos]), 1)} for pos, v in per.items()}
+    for pos in ("QB", "RB", "WR", "TE", "K"):
+        ranked = sorted([t for t in out if pos in out[t]], key=lambda t: out[t][pos]["avg"])
+        for i, t in enumerate(ranked):
+            out[t][pos]["rank"] = i + 1
+            out[t][pos]["n"] = len(ranked)
+    return {"season": season, "through": through, "teams": out}
+
+
+STADIUMS = {  # lat, lon, dome (roof closed or retractable usually closed)
+    'ARI': (33.5276, -112.2626, True), 'ATL': (33.7554, -84.4010, True), 'BAL': (39.2780, -76.6227, False), 'BUF': (42.7738, -78.7870, False),
+    'CAR': (35.2258, -80.8528, False), 'CHI': (41.8623, -87.6167, False), 'CIN': (39.0955, -84.5161, False), 'CLE': (41.5061, -81.6995, False),
+    'DAL': (32.7473, -97.0945, True), 'DEN': (39.7439, -105.0201, False), 'DET': (42.3400, -83.0456, True), 'GB': (44.5013, -88.0622, False),
+    'HOU': (29.6847, -95.4107, True), 'IND': (39.7601, -86.1639, True), 'JAX': (30.3239, -81.6373, False), 'KC': (39.0489, -94.4839, False),
+    'LAC': (33.9535, -118.3392, True), 'LAR': (33.9535, -118.3392, True), 'LV': (36.0909, -115.1833, True), 'MIA': (25.9580, -80.2389, False),
+    'MIN': (44.9737, -93.2577, True), 'NE': (42.0909, -71.2643, False), 'NO': (29.9511, -90.0812, True), 'NYG': (40.8135, -74.0745, False),
+    'NYJ': (40.8135, -74.0745, False), 'PHI': (39.9008, -75.1675, False), 'PIT': (40.4468, -80.0158, False), 'SEA': (47.5952, -122.3316, False),
+    'SF': (37.4033, -121.9694, False), 'TB': (27.9759, -82.5033, False), 'TEN': (36.1665, -86.7713, False), 'WAS': (38.9076, -76.8645, False)}
+
+
+def weather(season, week):
+    """Kickoff-hour forecast for outdoor games this week (Open-Meteo, no key). Kickoff time from
+    ESPN when reachable, else 1pm Eastern on the scheduled date."""
+    gs = games(season, week)
+    kick = {}
+    try:
+        d = fetch_json("https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week=%s&seasontype=2&year=%s" % (week, season), ttl=3600)
+        for ev in d.get("events", []):
+            for comp in ev["competitions"][0].get("competitors", []):
+                ab = (comp.get("team") or {}).get("abbreviation")
+                if ab:
+                    kick[ESPN_ABBR.get(ab, ab)] = ev.get("date")
+    except Exception:
+        pass
+    out = {}
+    for g in gs:
+        home = g["home"]; st = STADIUMS.get(home)
+        if not st:
+            continue
+        lat, lon, dome = st
+        if dome:
+            out[home] = out[g["away"]] = {"dome": True}
+            continue
+        iso = kick.get(home)
+        if iso:
+            hour = iso[:13].replace("T", "T")
+        else:
+            hour = "%sT13:00" % g["date"]
+        try:
+            w = fetch_json("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&hourly=temperature_2m,precipitation_probability,wind_speed_10m,wind_gusts_10m&wind_speed_unit=mph&temperature_unit=fahrenheit&forecast_days=16&timezone=America%%2FNew_York" % (lat, lon), ttl=3600, disk=True)
+            times = w["hourly"]["time"]
+            # ESPN dates are UTC; Open-Meteo hours are Eastern. Convert UTC hour to Eastern (-4 in season).
+            if iso:
+                from datetime import datetime, timedelta
+                t = datetime.strptime(iso[:16], "%Y-%m-%dT%H:%M") - timedelta(hours=4)
+                hour = t.strftime("%Y-%m-%dT%H:00")
+            if hour in times:
+                i = times.index(hour)
+                out[home] = out[g["away"]] = {"dome": False, "temp": w["hourly"]["temperature_2m"][i], "wind": w["hourly"]["wind_speed_10m"][i], "gust": w["hourly"]["wind_gusts_10m"][i], "precip": w["hourly"]["precipitation_probability"][i], "at": hour}
+            else:
+                out[home] = out[g["away"]] = {"dome": False, "unavailable": True}
+        except Exception:
+            out[home] = out[g["away"]] = {"dome": False, "unavailable": True}
+    return out
 
 
 def tendencies(league_id):
@@ -722,6 +856,14 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "trending":
                 return self.send_json(sleeper_v1(
                     f"players/nfl/trending/{q.get('type','add')}?lookback_hours={q.get('hours','48')}&limit=100", ttl=900))
+            if path == "news":
+                return self.send_json(news(int(q.get("limit", "100"))))
+            if path == "usage":
+                return self.send_json(usage(q.get("season", "2026"), q.get("through", "1")))
+            if path == "dvp":
+                return self.send_json(dvp(q.get("season", "2025"), q.get("through", "18")))
+            if path == "weather":
+                return self.send_json(weather(q.get("season", "2026"), q.get("week", "1")))
             if path == "volatility":
                 return self.send_json(volatility(q.get("season", "2025")))
             if path == "tendencies":
