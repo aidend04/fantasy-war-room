@@ -67,7 +67,14 @@ Your username and league are remembered in the browser.
 - **Rest of season** = sum of Sleeper weekly projections from the selected week through week 18.
 - **ADP format** auto-selects 2QB for superflex leagues, else PPR / half / standard from the `rec` setting.
 
-The layout adapts below 700px wide (stacked header, two-column tiles, less important columns hidden).
+## Layout
+
+Desktop: a compact top bar (league, week and status in the middle; refresh and settings on the right) with a
+tab strip beneath. Phone (under 760px): a bottom tab bar for Draft, Team, Waivers, Matchup and League with the
+rest under More; stat tiles become a swipeable strip; the draft board, waivers, lineup, matchup and power
+rankings render as cards instead of wide tables; other tables scroll sideways inside their card. Settings
+(username, league, week, value basis, Vegas, scoring, theme) live in a slide-in sheet on every size. Dark and
+light themes follow the system by default and can be forced in Settings.
 
 ## Game-day alerts from cron
 
