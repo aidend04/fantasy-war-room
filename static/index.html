@@ -535,8 +535,8 @@ function viewDraft() {
     if (sim) {
       p.probNext = sim.poolIds.has(p.id) ? sim.pAvail[p.id] : 0.97;
       p.probNext2 = myNext2 ? (sim.poolIds.has(p.id) ? sim.pAvail2[p.id] : 0.95) : null;
-      p.waitCost = p.vorpS - sim.eBest[p.pos];
-      p.rec = needMult(p.pos) * (0.4 * p.vorpS + 0.6 * p.waitCost);
+      p.waitCost = p.vorpS - (sim.myNext2 ? sim.eBest2 : sim.eBest)[p.pos];
+      p.rec = needMult(p.pos) * (0.4 * p.vorpS + 0.6 * p.waitCost) * (myNext.no === nextPickNo ? 1 : 0.5 + 0.5 * p.probNext);
     } else {
       p.probNext = myNext ? availProb(p, myNext.no) : null;
       p.probNext2 = myNext2 ? availProb(p, myNext2.no) : null;
@@ -562,14 +562,14 @@ function viewDraft() {
   </div>`;
   const runCounts = {}; S.picks.slice(-8).forEach(pk => { const p = S.byId[pk.player_id]; if (p) runCounts[p.pos] = (runCounts[p.pos] || 0) + 1; });
   const adapterBox = sim ? `<div class="card"><h3>Draft adapter · ${sim.between.length} picks before you${myNext2 ? `, then ${myNext2.no - myNext.no - 1} more` : ''}</h3>
-    <div class="tablewrap"><table><thead><tr><th>Pos</th><th>Best now</th><th class="r">Now</th><th class="r">@${myNext.no}</th><th class="r">Wait cost</th><th class="r" title="Teams picking before you that still need a starter here">Need</th><th class="r" title="Taken in the last 8 picks">Run</th></tr></thead><tbody>
-    ${POS.map(pos => { const best = rows.filter(p => p.pos === pos).sort((a, b) => b.vorpS - a.vorpS)[0]; if (!best) return ''; const wc = best.vorpS - sim.eBest[pos]; return `<tr><td><span class="pos ${pos}">${pos}</span></td><td>${esc(best.name)}</td><td class="r">${f0(best.vorpS)}</td><td class="r muted">${f0(sim.eBest[pos])}</td><td class="r ${wc > 25 ? 'bad' : wc > 10 ? 'warn' : 'good'}"><b>${f0(wc)}</b></td><td class="r">${sim.needsBefore[pos] || 0}/${sim.between.length}</td><td class="r ${runCounts[pos] >= 3 ? 'warn' : 'muted'}">${runCounts[pos] || 0}</td></tr>`; }).join('')}
+    <div class="tablewrap"><table><thead><tr><th>Pos</th><th>Best now</th><th class="r">Now</th><th class="r" title="Expected best value at this position at your next pick">@${myNext.no}</th>${myNext2 ? `<th class="r" title="Expected best value at this position at the pick after">@${myNext2.no}</th>` : ''}<th class="r">Wait cost</th><th class="r" title="Teams picking before you that still need a starter here">Need</th><th class="r" title="Taken in the last 8 picks">Run</th></tr></thead><tbody>
+    ${POS.map(pos => { const best = rows.filter(p => p.pos === pos).sort((a, b) => b.vorpS - a.vorpS)[0]; if (!best) return ''; const wc = best.vorpS - (myNext2 ? sim.eBest2 : sim.eBest)[pos]; return `<tr><td><span class="pos ${pos}">${pos}</span></td><td>${esc(best.name)}</td><td class="r">${f0(best.vorpS)}</td><td class="r muted">${f0(sim.eBest[pos])}</td>${myNext2 ? `<td class="r muted">${f0(sim.eBest2[pos])}</td>` : ''}<td class="r ${wc > 25 ? 'bad' : wc > 10 ? 'warn' : 'good'}"><b>${f0(wc)}</b></td><td class="r">${sim.needsBefore[pos] || 0}/${sim.between.length}</td><td class="r ${runCounts[pos] >= 3 ? 'warn' : 'muted'}">${runCounts[pos] || 0}</td></tr>`; }).join('')}
     </tbody></table></div>
-    <div class="note">${sim.nSims} simulated drafts of the picks before yours, using ADP order tilted by each team's roster needs. Wait cost = best value now minus the expected best at that position when you pick next; a high wait cost means the position is about to fall off a cliff, so take it now. Low means you can wait.</div></div>` : '';
+    <div class="note">${sim.nSims} simulated drafts of the picks before yours, using ADP order tilted by each team's roster needs. Wait cost = best value now minus the expected best at that position at your following pick (#${myNext2 ? myNext2.no : myNext.no}); a high wait cost means the position falls off a cliff if you pass, so take it now. Low means you can wait a round.</div></div>` : '';
   const suggBox = `<div class="card"><h3>${drafting ? 'Recommended now' : 'Best values on the board'}</h3>
     ${sugg.map((p, i) => `<div style="display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)"><span>${i + 1}. ${pcell(p, { noOwner: true })}</span><span class="r muted small">VORP <b class="good">+${f1(p.vorpS)}</b>${p.waitCost != null ? ` · wait cost ${f0(p.waitCost)}` : ''} · ADP ${f1(p.adp)}</span></div>`).join('')}
     ${waitable.length ? `<h3 style="margin-top:12px">Likely there at your next pick</h3><div class="small">${waitable.map(p => `${esc(p.name)} <span class="good">${pct(p.probNext)}</span>`).join(' · ')}</div>` : ''}
-    <div class="note">${sim ? 'Rec = need × (40% value over replacement + 60% wait cost), from the simulated picks before yours.' : 'Rec score = value over replacement × your positional need. Availability uses FFC ADP spread (falls back to Sleeper ADP).'}</div></div>`;
+    <div class="note">${sim ? 'Rec = need × (40% value over replacement + 60% wait cost), discounted by the chance the player is gone before your pick.' : 'Rec score = value over replacement × your positional need. Availability uses FFC ADP spread (falls back to Sleeper ADP).'}</div></div>`;
   const mineBox = myPicked.length ? `<div class="card"><h3>My picks</h3>${myPicked.map(p => `<div class="small" style="padding:3px 0">${pcell(p, { noOwner: true })} <span class="muted">${f0(p.season)} pts</span></div>`).join('')}</div>` : '';
   const recent = S.picks.slice(-8).reverse();
   const recentBox = S.picks.length ? `<div class="card"><h3>Last picks</h3>${recent.map(pk => { const p = S.byId[pk.player_id]; return `<div class="small" style="padding:3px 0"><span class="muted">#${pk.pick_no}</span> ${p ? pcell(p, { noOwner: true }) : esc(pk.metadata?.first_name + ' ' + pk.metadata?.last_name)} <span class="muted">${esc(teamName(pk.roster_id))}</span></div>`; }).join('')}</div>` : '';
