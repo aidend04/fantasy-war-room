@@ -493,9 +493,160 @@ def player_detail(pid, season):
     return {"prev_season": prev, "log": trim(log), "proj": trim(proj)}
 
 
+ESPN_ABBR = {"WSH": "WAS"}
+
+
+def espn_progress(season, week):
+    """{team: {state, progress}} from ESPN's public scoreboard: progress = fraction of game time elapsed."""
+    try:
+        d = fetch_json("https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week=%s&seasontype=2&year=%s" % (week, season), ttl=45)
+    except Exception:
+        return {}
+    out = {}
+    for ev in d.get("events", []):
+        c = (ev.get("competitions") or [{}])[0]
+        st = c.get("status") or {}
+        state = (st.get("type") or {}).get("state", "pre")
+        period = st.get("period") or 0
+        clock = st.get("displayClock") or "0:00"
+        try:
+            mm, ss = clock.split(":"); left = int(mm) + int(ss) / 60.0
+        except Exception:
+            left = 0.0
+        if state == "post":
+            prog = 1.0
+        elif state == "in":
+            prog = min(0.99, max(0.0, ((period - 1) * 15 + (15 - left)) / 60.0)) if period <= 4 else 0.97
+        else:
+            prog = 0.0
+        for comp in c.get("competitors", []):
+            ab = (comp.get("team") or {}).get("abbreviation")
+            if ab:
+                out[ESPN_ABBR.get(ab, ab)] = {"state": state, "progress": round(prog, 3), "detail": (st.get("type") or {}).get("shortDetail")}
+    return out
+
+
 def games(season, week):
     data = fetch_json("https://api.sleeper.app/schedule/nfl/regular/%s" % season, ttl=60, disk=False)
-    return [g for g in data if str(g.get("week")) == str(week)]
+    prog = espn_progress(season, week)
+    out = []
+    for g in data:
+        if str(g.get("week")) != str(week):
+            continue
+        e = prog.get(g["home"]) or prog.get(g["away"]) or {}
+        g = dict(g)
+        g["progress"] = e.get("progress", 1.0 if g.get("status") == "complete" else 0.0)
+        g["detail"] = e.get("detail")
+        if e.get("state") == "in":
+            g["status"] = "in_game"
+        elif e.get("state") == "post":
+            g["status"] = "complete"
+        out.append(g)
+    return out
+
+
+def volatility(season):
+    """Per-player weekly PPR mean and spread from a full season of game logs, plus position medians."""
+    q = "season_type=regular&" + "&".join("position[]=" + p for p in POSITIONS)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        weeks = list(ex.map(lambda w: fetch_json("https://api.sleeper.com/stats/nfl/%s/%s?%s" % (season, w, q), ttl=7 * 86400, disk=True), range(1, 19)))
+    pts = {}
+    for rows in weeks:
+        for r in rows:
+            s = r.get("stats") or {}
+            if "pts_ppr" in s and (s.get("gp") or s.get("gms_active") or s.get("off_snp") or s.get("pts_ppr")):
+                pts.setdefault(r["player_id"], []).append(s["pts_ppr"] or 0.0)
+    players = players_trimmed()
+    out, by_pos = {}, {}
+    for pid, arr in pts.items():
+        if len(arr) < 4:
+            continue
+        m = sum(arr) / len(arr)
+        sd = (sum((x - m) ** 2 for x in arr) / (len(arr) - 1)) ** 0.5
+        cv = sd / m if m > 3 else None
+        out[pid] = {"n": len(arr), "mean": round(m, 2), "sd": round(sd, 2), "cv": round(cv, 3) if cv else None}
+        pos = players.get(pid, {}).get("pos")
+        if cv and pos:
+            by_pos.setdefault(pos, []).append(cv)
+    med = {pos: sorted(v)[len(v) // 2] for pos, v in by_pos.items() if v}
+    return {"season": season, "players": out, "pos_cv": med}
+
+
+def tendencies(league_id):
+    """Per-manager habits across seasons: where they take QB/TE/K/DEF in drafts, reach vs ADP,
+    FAAB spending, and trade count. Keyed by user id so it survives roster-id changes."""
+    chain = league_chain(league_id)
+    users = {}
+    for lg in chain:
+        season, lid = lg["season"], lg["league_id"]
+        sc = lg.get("scoring_settings") or {}
+        rp = lg.get("roster_positions") or []
+        fmt = "adp_2qb" if "SUPER_FLEX" in rp else "adp_ppr" if (sc.get("rec") or 0) >= 1 else "adp_half_ppr" if (sc.get("rec") or 0) >= 0.5 else "adp_std"
+        try:
+            adp = {r["player_id"]: (r.get("stats") or {}).get(fmt) for r in fetch_json("https://api.sleeper.com/projections/nfl/%s?season_type=regular&%s&order_by=pts_ppr" % (season, "&".join("position[]=" + p for p in POSITIONS)), ttl=7 * 86400, disk=True)}
+        except Exception:
+            adp = {}
+        for u in sleeper_v1("league/%s/users" % lid, ttl=3600):
+            d = users.setdefault(u["user_id"], {"name": (u.get("metadata") or {}).get("team_name") or u.get("display_name"), "seasons": [], "first": {"QB": [], "TE": [], "K": [], "DEF": []}, "vs_adp": [], "bids": 0, "won": 0, "spent": 0, "trades": 0, "picks": 0})
+            if season not in d["seasons"]:
+                d["seasons"].append(season)
+        rosters = {r["roster_id"]: r.get("owner_id") for r in sleeper_v1("league/%s/rosters" % lid, ttl=3600)}
+        for dr in sleeper_v1("league/%s/drafts" % lid, ttl=3600) or []:
+            if dr.get("status") != "complete":
+                continue
+            picks = sleeper_v1("draft/%s/picks" % dr["draft_id"], ttl=7 * 86400)
+            seen = set()
+            for pk in picks:
+                uid = pk.get("picked_by") or rosters.get(pk.get("roster_id"))
+                if uid not in users:
+                    continue
+                d = users[uid]; d["picks"] += 1
+                pos = (pk.get("metadata") or {}).get("position")
+                if pos in d["first"] and (uid, pos) not in seen:
+                    d["first"][pos].append(pk["round"]); seen.add((uid, pos))
+                a = adp.get(pk.get("player_id"))
+                if a and a < 900:
+                    d["vs_adp"].append(pk["pick_no"] - a)
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            tx = list(ex.map(lambda w: sleeper_v1("league/%s/transactions/%s" % (lid, w), ttl=1800 if season == chain[0]["season"] else 7 * 86400), range(1, 18)))
+        for ts in tx:
+            for t in ts or []:
+                if t.get("type") == "trade":
+                    for rid in t.get("roster_ids") or []:
+                        uid = rosters.get(rid)
+                        if uid in users:
+                            users[uid]["trades"] += 1
+                elif t.get("type") == "waiver" and (t.get("settings") or {}).get("waiver_bid") is not None:
+                    for rid in t.get("roster_ids") or []:
+                        uid = rosters.get(rid)
+                        if uid in users:
+                            users[uid]["bids"] += 1
+                            if t.get("status") == "complete":
+                                users[uid]["won"] += 1; users[uid]["spent"] += t["settings"]["waiver_bid"]
+    out = []
+    for uid, d in users.items():
+        avg = lambda a: round(sum(a) / len(a), 1) if a else None
+        out.append({"user_id": uid, "name": d["name"], "seasons": len(d["seasons"]), "picks": d["picks"],
+                    "first_qb": avg(d["first"]["QB"]), "first_te": avg(d["first"]["TE"]), "first_k": avg(d["first"]["K"]), "first_def": avg(d["first"]["DEF"]),
+                    "vs_adp": avg(d["vs_adp"]), "bids": d["bids"], "won": d["won"], "spent": d["spent"], "avg_bid": round(d["spent"] / d["won"], 1) if d["won"] else None, "trades": d["trades"]})
+    return {"seasons": [lg["season"] for lg in chain], "managers": out}
+
+
+def team_snapshot_save(body):
+    c = db()
+    c.execute("CREATE TABLE IF NOT EXISTS team_snap (league TEXT, season TEXT, week INTEGER, rid INTEGER, name TEXT, val REAL, playoff REAL, title REAL, taken_at REAL, PRIMARY KEY(league, season, week, rid))")
+    c.executemany("INSERT OR REPLACE INTO team_snap VALUES (?,?,?,?,?,?,?,?,?)",
+                  [(str(body["league_id"]), str(body["season"]), int(body["week"]), int(t["rid"]), t.get("name"), float(t.get("val") or 0), float(t.get("playoff") or 0), float(t.get("title") or 0), time.time()) for t in body.get("teams", [])])
+    c.commit(); c.close()
+    return {"ok": True}
+
+
+def team_snapshot_load(league, season):
+    c = db()
+    c.execute("CREATE TABLE IF NOT EXISTS team_snap (league TEXT, season TEXT, week INTEGER, rid INTEGER, name TEXT, val REAL, playoff REAL, title REAL, taken_at REAL, PRIMARY KEY(league, season, week, rid))")
+    rows = c.execute("SELECT week, rid, name, val, playoff, title FROM team_snap WHERE league=? AND season=? ORDER BY week", (str(league), str(season))).fetchall()
+    c.close()
+    return {"rows": [dict(zip(["week", "rid", "name", "val", "playoff", "title"], r)) for r in rows]}
 
 
 def adp(fmt, teams):
@@ -534,6 +685,8 @@ class Handler(SimpleHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
         try:
+            if u.path == "/api/snapshot/team":
+                return self.send_json(team_snapshot_save(body))
             if u.path == "/api/matrix":
                 scoring = body.get("scoring") or DEFAULT_SCORING.get(body.get("scoringKey", "half"), DEFAULT_SCORING["half"])
                 return self.send_json(matrix(str(body.get("season", "2026")), scoring, body.get("weights")))
@@ -569,6 +722,12 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "trending":
                 return self.send_json(sleeper_v1(
                     f"players/nfl/trending/{q.get('type','add')}?lookback_hours={q.get('hours','48')}&limit=100", ttl=900))
+            if path == "volatility":
+                return self.send_json(volatility(q.get("season", "2025")))
+            if path == "tendencies":
+                return self.send_json(tendencies(q["league"]))
+            if path == "snapshot/team":
+                return self.send_json(team_snapshot_load(q["league"], q.get("season", "2026")))
             if path == "games":
                 return self.send_json(games(q.get("season", "2026"), q.get("week", "1")))
             if path.startswith("player/"):

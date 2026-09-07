@@ -22,7 +22,7 @@ Your username and league are remembered in the browser.
 | Tiers | Positional tier sheets with tier breaks and replacement level. Drafted/rostered players are crossed out. |
 | My Team | Optimal lineup for the selected week vs your current lineup, roster value, drop candidates, bye-week map. |
 | Waivers | Free agents ranked by rest-of-season VORP, with the upgrade over your weakest player at that position and Sleeper add/drop trends. |
-| Matchup | Projected score vs your opponent and win probability before kickoff; once games start it goes **live**: finished players count actual points, in-progress players count points so far plus half their projection, and it refreshes every minute. |
+| Matchup | Projected score vs your opponent and win probability before kickoff; once games start it goes **live**: finished players count actual points, in-progress players count points so far plus the unplayed share of their projection using the real game clock from ESPN's scoreboard, and it refreshes every minute. |
 | League | Power rankings from every team's best rest-of-season lineup, with positional strength so you can find trade partners. |
 | Trade | Tick players on both sides; it scores the trade by the change in each team's best lineup plus bench value. |
 
@@ -41,6 +41,9 @@ Your username and league are remembered in the browser.
 - **FAAB model**: every waiver bid (won and lost) in the league and its two previous seasons, each tagged
   with the target's positional rank by projection that week. Suggested bids are the median and 75th
   percentile of winning bids for comparable targets in the same part of the season.
+- **Floor / ceiling**: each player's game-to-game coefficient of variation from last season's logs (position median
+  when fewer than four games); floor and ceiling are the 20th and 80th percentile of a normal around the week's
+  projection. Auto mode picks floor when your pre-game win probability is above 62%, ceiling below 38%.
 - **Trade finder**: team value = best lineup on the chosen basis + 35% of top-four bench VORP; offers are
   kept when your gain is 4+ and theirs is at least −3, ranked by your gain plus half of theirs.
 
@@ -63,6 +66,8 @@ Your username and league are remembered in the browser.
 - **No league loaded**: the Scoring selector (default half PPR) drives points and ADP format.
 - **Rest of season** = sum of Sleeper weekly projections from the selected week through week 18.
 - **ADP format** auto-selects 2QB for superflex leagues, else PPR / half / standard from the `rec` setting.
+
+The layout adapts below 700px wide (stacked header, two-column tiles, less important columns hidden).
 
 ## Game-day alerts from cron
 
