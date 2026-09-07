@@ -123,6 +123,18 @@ td.wrap{white-space:normal;line-height:1.7}
 @media (prefers-reduced-motion:no-preference){ .live{animation:pulse 1.6s infinite} }
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--good);margin-right:6px}
+b.pn{cursor:pointer;border-bottom:1px dotted var(--faint)} b.pn:hover{color:var(--accent)}
+#drawer{position:fixed;top:0;right:0;height:100vh;width:min(560px,100vw);background:var(--surface);border-left:1px solid var(--border);box-shadow:var(--shadow);overflow-y:auto;padding:18px 20px 40px;z-index:50;transform:translateX(100%);transition:transform .2s}
+#drawer.open{transform:none}
+@media (prefers-reduced-motion:reduce){#drawer{transition:none}}
+#drawer .close{position:absolute;top:12px;right:14px}
+#drawer h2{font-size:26px}
+#drawer .tiles{grid-template-columns:repeat(auto-fit,minmax(110px,1fr))}
+#drawer .tile .v{font-size:24px}
+.spark{display:block;width:100%;height:56px}
+.spark rect{fill:var(--accent)} .spark rect.cur{fill:var(--good)} .spark rect.bye{fill:var(--faint)} .spark line{stroke:var(--border)} .spark text{fill:var(--muted);font-size:9px}
+.live{color:var(--good)} .chip.live{background:var(--good-soft);color:var(--good);border-color:transparent}
+.chip.final{background:var(--surface2)}
 .guide{margin-bottom:16px;border-left:4px solid var(--border)}
 .guide.clock{border-left-color:var(--accent);background:linear-gradient(90deg,var(--accent-soft),var(--surface) 40%)}
 .guide-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
@@ -159,6 +171,7 @@ code{font-family:"IBM Plex Mono",monospace;font-size:12px;background:var(--surfa
   <button data-tab="model">Model</button>
 </nav>
 <main id="view"><div class="empty">Loading projections, ADP and player data…</div></main>
+<aside id="drawer" aria-hidden="true"></aside>
 
 <script>
 /* ---------- utilities ---------- */
@@ -461,9 +474,9 @@ function teamNeed(comp, pos, round, R) {
   return pos === 'QB' || pos === 'TE' ? 0.2 : 0.35;
 }
 /* One bot pick: candidates in ADP order, weight = exp(-rank/tau) x positional need. */
-function botPick(adpSorted, taken, comp, slot, round, R, tau = 3.2, K = 22) {
+function botPick(adpSorted, taken, comp, slot, round, R, tau = 3.2, K = 22, needAware = true) {
   let cands = [], wsum = 0, seen = 0;
-  for (const p of adpSorted) { if (taken.has(p.id)) continue; const w = Math.exp(-seen / tau) * teamNeed(comp[slot] || {}, p.pos, round, R); cands.push([p, w]); wsum += w; if (++seen >= K) break; }
+  for (const p of adpSorted) { if (taken.has(p.id)) continue; const w = Math.exp(-seen / tau) * (needAware ? teamNeed(comp[slot] || {}, p.pos, round, R) : ((p.pos === 'K' || p.pos === 'DEF') && round < R - 2 ? 0.05 : 1)); cands.push([p, w]); wsum += w; if (++seen >= K) break; }
   if (!cands.length) return null;
   let r = Math.random() * wsum, chosen = cands[cands.length - 1][0];
   for (const [p, w] of cands) { r -= w; if (r <= 0) { chosen = p; break; } }
@@ -721,12 +734,72 @@ async function refreshAlerts() {
 }
 setInterval(refreshAlerts, 10 * 60 * 1000);
 
+/* ---------- player drawer ---------- */
+const STAT_COLS = {
+  QB: [['pass_cmp', 'Cmp'], ['pass_att', 'Att'], ['pass_yd', 'Pass yd'], ['pass_td', 'TD'], ['pass_int', 'Int'], ['rush_yd', 'Rush yd'], ['rush_td', 'Rush TD']],
+  RB: [['rush_att', 'Car'], ['rush_yd', 'Rush yd'], ['rush_td', 'TD'], ['rec_tgt', 'Tgt'], ['rec', 'Rec'], ['rec_yd', 'Rec yd'], ['rec_td', 'Rec TD']],
+  WR: [['rec_tgt', 'Tgt'], ['rec', 'Rec'], ['rec_yd', 'Yd'], ['rec_td', 'TD'], ['rush_att', 'Car'], ['rush_yd', 'Rush yd']],
+  TE: [['rec_tgt', 'Tgt'], ['rec', 'Rec'], ['rec_yd', 'Yd'], ['rec_td', 'TD']],
+  K: [['fgm', 'FGM'], ['fga', 'FGA'], ['fgm_50p', '50+'], ['xpm', 'XP']],
+  DEF: [['sack', 'Sack'], ['int', 'Int'], ['fum_rec', 'FR'], ['def_td', 'TD'], ['pts_allow', 'PA'], ['yds_allow', 'YA']]
+};
+function sparkline(vals, opts = {}) {
+  const w = 300, h = 56, n = vals.length, bw = w / n, max = Math.max(1, ...vals.map(v => v.v || 0));
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="${esc(opts.label || '')}">
+    <line x1="0" y1="${h - 12}" x2="${w}" y2="${h - 12}"/>
+    ${vals.map((v, i) => { const bh = Math.max(0, (v.v || 0) / max * (h - 16)); return `<rect class="${v.cls || ''}" x="${(i * bw + 1).toFixed(1)}" y="${(h - 12 - bh).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${bh.toFixed(1)}"><title>${esc(v.t || '')}</title></rect><text x="${(i * bw + bw / 2).toFixed(1)}" y="${h - 2}" text-anchor="middle">${v.l ?? ''}</text>`; }).join('')}</svg>`;
+}
+async function openPlayer(id) {
+  const p = S.byId[id]; if (!p) return;
+  const d = $('#drawer'); d.classList.add('open'); d.setAttribute('aria-hidden', 'false');
+  d.innerHTML = `<button class="close tiny" id="drawer-close">✕</button>${playerHead(p)}<div class="empty">Loading game log…</div>`;
+  bindDrawer();
+  S.playerCache = S.playerCache || {};
+  try { if (!S.playerCache[id]) S.playerCache[id] = await api(`player/${id}?season=${S.state.season}`); } catch (e) { S.playerCache[id] = { log: {}, proj: {}, prev_season: S.state.season - 1 }; }
+  if (!d.classList.contains('open') || d.dataset.p !== id) { if (d.dataset.p !== id) return; }
+  d.innerHTML = `<button class="close tiny" id="drawer-close">✕</button>${playerHead(p)}${playerBody(p, S.playerCache[id])}`;
+  bindDrawer();
+}
+function playerHead(p) {
+  $('#drawer').dataset.p = p.id;
+  const owner = p.rosterId != null ? (S.myRoster && p.rosterId === S.myRoster.roster_id ? 'On your roster' : 'Rostered by ' + teamName(p.rosterId)) : (S.league ? 'Free agent' : '');
+  return `<h2><span class="pos ${p.pos}">${p.pos}</span> ${esc(p.name)}</h2>
+    <div class="muted" style="margin:4px 0 10px">${p.team || 'FA'} · bye ${p.bye || '–'}${p.age ? ' · age ' + p.age : ''}${p.exp != null ? ' · ' + (p.exp ? p.exp + ' yr' : 'rookie') : ''}${p.inj ? ` · <span class="bad">${esc(p.inj)}${p.injNote ? ' (' + esc(p.injNote) + ')' : ''}</span>` : ''}${owner ? ' · ' + esc(owner) : ''}</div>
+    <div class="tiles">
+      <div class="tile"><div class="k">Week ${S.wkNum}</div><div class="v">${f1(p.week)}</div><div class="s">${p.opp ? 'vs ' + esc(p.opp) : p.bye === S.wkNum ? 'bye' : ''}</div></div>
+      <div class="tile"><div class="k">ROS</div><div class="v">${f0(p.ros)}</div><div class="s">${p.pos}${p.tierRRank || ''} · VORP ${p.vorpR > 0 ? '+' : ''}${f0(p.vorpR)}</div></div>
+      <div class="tile"><div class="k">Playoffs</div><div class="v">${f0(p.playoff)}</div><div class="s">wk ${S.playoffWeeks.join(', ')}</div></div>
+      <div class="tile"><div class="k">Season</div><div class="v">${f0(p.season)}</div><div class="s">ADP ${f1(p.adp)}${p.trendAdd ? ' · +' + f0(p.trendAdd / 1000) + 'k adds' : ''}</div></div>
+    </div>
+    <div class="small muted" style="margin:8px 0">Sources this week: Sleeper ${f1(p.srcWeek.sleeper)} · ESPN ${f1(p.srcWeek.espn)} &nbsp;|&nbsp; season: Sleeper ${f0(p.srcSeason.sleeper)} · ESPN ${f0(p.srcSeason.espn)}</div>`;
+}
+function playerBody(p, det) {
+  const weeks = S.matrix.weeks;
+  const projVals = weeks.map(w => ({ v: p.weekly ? p.weekly[w - 1] : 0, l: w, cls: w === S.wkNum ? 'cur' : (p.bye === w ? 'bye' : ''), t: `Week ${w}${S.matrix.opp[w] && S.matrix.opp[w][p.id] ? ' vs ' + S.matrix.opp[w][p.id] : ''}: ${f1(p.weekly ? p.weekly[w - 1] : 0)}` }));
+  const cols = STAT_COLS[p.pos] || [];
+  const logWeeks = Object.keys(det.log || {}).map(Number).sort((a, b) => a - b);
+  const logVals = logWeeks.map(w => { const s = det.log[w].stats; return { v: scoreStats(s), l: w, t: `Week ${w} vs ${det.log[w].opp || '?'}: ${f1(scoreStats(s))}` }; });
+  const played = logVals.filter(v => v.v != null);
+  const avg = played.length ? sum(played.map(v => v.v)) / played.length : null;
+  return `<h3 style="margin-top:12px">${S.state.season} weekly projections</h3>${sparkline(projVals, { label: 'weekly projections' })}
+    <div class="tablewrap" style="max-height:220px;overflow:auto"><table><thead><tr><th>Wk</th><th>Opp</th><th class="r">Proj</th>${cols.map(c => `<th class="r">${c[1]}</th>`).join('')}</tr></thead><tbody>
+    ${weeks.map(w => { const pr = det.proj && det.proj[w]; const st = pr ? pr.stats : {}; return `<tr class="${w === S.wkNum ? 'mine' : ''}"><td class="slot">${w}</td><td class="muted">${p.bye === w ? 'BYE' : esc((S.matrix.opp[w] && S.matrix.opp[w][p.id]) || (pr && pr.opp) || '')}</td><td class="r"><b>${f1(p.weekly ? p.weekly[w - 1] : 0)}</b></td>${cols.map(c => `<td class="r muted">${st[c[0]] != null ? f1(st[c[0]]) : ''}</td>`).join('')}</tr>`; }).join('')}</tbody></table></div>
+    <h3 style="margin-top:14px">${det.prev_season} game log${avg != null ? ` · ${f1(avg)} avg over ${played.length} games` : ''}</h3>
+    ${logVals.length ? sparkline(logVals, { label: 'last season game log' }) + `<div class="tablewrap" style="max-height:260px;overflow:auto"><table><thead><tr><th>Wk</th><th>Opp</th><th class="r">Pts</th>${cols.map(c => `<th class="r">${c[1]}</th>`).join('')}</tr></thead><tbody>
+    ${logWeeks.map(w => { const g = det.log[w], st = g.stats; return `<tr><td class="slot">${w}</td><td class="muted">${esc(g.opp || '')}</td><td class="r"><b>${f1(scoreStats(st))}</b></td>${cols.map(c => `<td class="r muted">${st[c[0]] != null ? f0(st[c[0]]) : ''}</td>`).join('')}</tr>`; }).join('')}</tbody></table></div>` : '<div class="empty">No games last season.</div>'}
+    <div class="note">Points use ${S.league ? "this league's scoring" : 'the Scoring selector'}. Green bar = selected week, grey = bye.</div>`;
+}
+function closeDrawer() { const d = $('#drawer'); d.classList.remove('open'); d.setAttribute('aria-hidden', 'true'); d.dataset.p = ''; }
+function bindDrawer() { const c = $('#drawer-close'); if (c) c.onclick = closeDrawer; }
+document.addEventListener('click', e => { const b = e.target.closest && e.target.closest('b.pn'); if (b) { e.preventDefault(); openPlayer(b.dataset.p); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+
 /* ---------- rendering helpers ---------- */
 function pcell(p, opts = {}) {
   const inj = p.inj ? `<span class="injury ${p.inj === 'Questionable' ? 'Q' : ''}" title="${esc(p.injNote || '')}">${{Questionable:'Q',Doubtful:'D',Out:'O',IR:'IR',PUP:'PUP',Sus:'SUS',NA:'NA'}[p.inj] || esc(p.inj)}</span>` : '';
   const own = p.rosterId != null && !opts.noOwner ? `<span class="chip ${S.myRoster && p.rosterId === S.myRoster.roster_id ? 'acc' : ''}">${esc(S.myRoster && p.rosterId === S.myRoster.roster_id ? 'mine' : teamName(p.rosterId))}</span>` : '';
   const dis = p.disagree ? `<span class="chip warn" title="Sources disagree this week: Sleeper ${f1(p.srcWeek.sleeper)} vs ESPN ${f1(p.srcWeek.espn)}">±</span>` : '';
-  return `<span class="pos ${p.pos}">${p.pos}</span> <b>${esc(p.name)}</b> <span class="muted small">${p.team || 'FA'}${p.bye ? ' · bye ' + p.bye : ''}</span>${inj}${dis}${own}`;
+  return `<span class="pos ${p.pos}">${p.pos}</span> <b class="pn" data-p="${p.id}" title="Player details">${esc(p.name)}</b> <span class="muted small">${p.team || 'FA'}${p.bye ? ' · bye ' + p.bye : ''}</span>${inj}${dis}${own}`;
 }
 function sortRows(rows, key, def, desc = true) {
   const s = S.sort[key] || { by: def, desc };
@@ -863,11 +936,12 @@ function renderDraft(B) {
 }
 function draftRecap(ctx) {
   const byTeam = {}; ctx.picks.forEach(pk => { const k = ctx.keyOf(pk); (byTeam[k] = byTeam[k] || []).push(pk); });
-  const rows = Object.entries(byTeam).map(([k, pks]) => { const ps = pks.map(pk => S.byId[pk.player_id]).filter(Boolean); const val = sum(ps.map(p => Math.max(0, p.vorpS))); const adpv = sum(pks.map(pk => { const p = S.byId[pk.player_id]; return p && p.adp ? pk.pick_no - p.adp : 0; })); return { k: isNaN(+k) ? k : +k, name: ctx.nameOfKey(isNaN(+k) ? k : +k), val, adpv, starters: optimalLineup(ps.map(p => p.id), 'season').total, ps }; }).sort((a, b) => b.starters - a.starters);
+  const rows = Object.entries(byTeam).map(([k, pks]) => { const ps = pks.map(pk => S.byId[pk.player_id]).filter(Boolean); const val = sum(ps.map(p => Math.max(0, p.vorpS))); const adpv = sum(pks.map(pk => { const p = S.byId[pk.player_id]; return p && p.adp ? pk.pick_no - p.adp : 0; })); return { k: isNaN(+k) ? k : +k, name: ctx.nameOfKey(isNaN(+k) ? k : +k), val, adpv, starters: optimalLineup(ps.map(p => p.id), 'season').total, startersE: optimalLineup(ps.map(p => p.id), p => p.srcSeason.espn ?? p.season).total, ps }; }).sort((a, b) => b.starters - a.starters);
+  const rankE = [...rows].sort((a, b) => b.startersE - a.startersE); rows.forEach(r => r.rankE = rankE.indexOf(r) + 1);
   const myRank = rows.findIndex(r => r.k === ctx.myKey) + 1;
   const me = rows.find(r => r.k === ctx.myKey);
   const lineup = me ? optimalLineup(me.ps.map(p => p.id), 'season') : null;
-  return `<div class="card"><h2>Draft recap${myRank ? ` · you rank #${myRank} of ${rows.length}` : ''}</h2><div class="tablewrap"><table><thead><tr><th>#</th><th>Team</th><th class="r">Proj starters</th><th class="r">Total VORP</th><th class="r">Picks vs ADP</th></tr></thead><tbody>${rows.map((r, i) => `<tr class="${r.k === ctx.myKey ? 'mine' : ''}"><td>${i + 1}</td><td>${esc(r.name)}</td><td class="r">${f0(r.starters)}</td><td class="r">${f0(r.val)}</td><td class="r ${r.adpv > 0 ? 'good' : 'bad'}">${r.adpv > 0 ? '+' : ''}${f0(r.adpv)}</td></tr>`).join('')}</tbody></table></div>
+  return `<div class="card"><h2>Draft recap${myRank ? ` · you rank #${myRank} of ${rows.length}` : ''}</h2><div class="tablewrap"><table><thead><tr><th>#</th><th>Team</th><th class="r">Proj starters</th><th class="r" title="Rank by ESPN-only projections">ESPN rank</th><th class="r">Total VORP</th><th class="r">Picks vs ADP</th></tr></thead><tbody>${rows.map((r, i) => `<tr class="${r.k === ctx.myKey ? 'mine' : ''}"><td>${i + 1}</td><td>${esc(r.name)}</td><td class="r">${f0(r.starters)}</td><td class="r muted">#${r.rankE}</td><td class="r">${f0(r.val)}</td><td class="r ${r.adpv > 0 ? 'good' : 'bad'}">${r.adpv > 0 ? '+' : ''}${f0(r.adpv)}</td></tr>`).join('')}</tbody></table></div>
     ${lineup ? `<h3 style="margin-top:14px">Your projected lineup</h3><div class="tablewrap"><table><tbody>${lineup.slots.map(s => `<tr><td class="slot">${s.slot.replace('_', ' ')}</td><td>${s.p ? pcell(s.p, { noOwner: true }) : '<span class="bad">EMPTY</span>'}</td><td class="r">${s.p ? f0(s.p.season) : ''}</td></tr>`).join('')}<tr><td class="slot">BN</td><td colspan="2" class="muted small">${lineup.bench.map(p => esc(p.name)).join(', ')}</td></tr></tbody></table></div>` : ''}
     <div class="note">Picks vs ADP: positive means the team drafted players later than their ADP on average (value); negative means reaches.</div></div>`;
 }
@@ -884,7 +958,7 @@ function mockNames(T, slot, live) {
 }
 function mockStart(cfg) {
   const d = mockDefaults();
-  const m = { T: +cfg.T || d.T, R: +cfg.R || d.R, type: cfg.type || d.type, reversal: +cfg.reversal || 0, slot: +cfg.slot || d.slot, tau: +cfg.tau || 3.2, picks: [], auto: false };
+  const m = { T: +cfg.T || d.T, R: +cfg.R || d.R, type: cfg.type || d.type, reversal: +cfg.reversal || 0, slot: +cfg.slot || d.slot, tau: +cfg.tau || 3.2, brain: cfg.brain || 'adp', picks: [], auto: false };
   m.names = mockNames(m.T, m.slot, d.live);
   S.mock = m; S.sim = null; mockAdvance();
 }
@@ -892,12 +966,20 @@ function mockBotTurn(m) {
   const no = m.picks.length + 1, slot = slotAtPick(no, m.T, m.type, m.reversal), round = Math.floor((no - 1) / m.T) + 1;
   const taken = new Set(m.picks.map(p => p.player_id));
   const comp = compFromPicks(m.picks, m.T);
-  const cands = S.P.filter(p => !taken.has(p.id) && p.adp && p.season > 0).sort((a, b) => a.adp - b.adp);
-  let p = botPick(cands, taken, comp, slot, round, m.R, m.tau);
+  const cands = botOrder(m.brain, taken);
+  let p = botPick(cands, taken, comp, slot, round, m.R, m.tau, 22, m.brain !== 'adp-pure');
   if (!p) p = S.P.filter(x => !taken.has(x.id) && x.season > 0).sort((a, b) => b.vorpS - a.vorpS)[0];
   if (!p) return false;
   m.picks.push({ pick_no: no, round, draft_slot: slot, roster_id: slot, player_id: p.id });
   return true;
+}
+/* How mock opponents rank the board. 'adp' mirrors real drafters; the others draft off an
+   independent value system so the recommender is not grading its own homework. */
+function botOrder(brain, taken) {
+  const avail = S.P.filter(p => !taken.has(p.id) && p.season > 0);
+  if (brain === 'espn') return avail.filter(p => p.srcSeason.espn != null).sort((a, b) => b.srcSeason.espn - a.srcSeason.espn);
+  if (brain === 'sleeper') return avail.filter(p => p.srcSeason.sleeper != null).sort((a, b) => b.srcSeason.sleeper - a.srcSeason.sleeper);
+  return avail.filter(p => p.adp).sort((a, b) => a.adp - b.adp);
 }
 function mockAdvance() {
   const m = S.mock; if (!m) return;
@@ -926,8 +1008,8 @@ function mockUndo() {
 /* Headless batch: play n full mocks taking the recommendation every time; report who you land. */
 async function mockBatch(n, cfg) {
   const d = mockDefaults();
-  const base = { T: +cfg.T || d.T, R: +cfg.R || d.R, type: cfg.type || d.type, reversal: +cfg.reversal || 0, slot: +cfg.slot || d.slot, tau: +cfg.tau || 3.2 };
-  const byRound = {}, ranks = [], starters = [];
+  const base = { T: +cfg.T || d.T, R: +cfg.R || d.R, type: cfg.type || d.type, reversal: +cfg.reversal || 0, slot: +cfg.slot || d.slot, tau: +cfg.tau || 3.2, brain: cfg.brain || 'adp' };
+  const byRound = {}, ranks = [], starters = [], ranksE = [];
   S.mockBatch = { running: true, done: 0, n };
   for (let i = 0; i < n; i++) {
     const m = { ...base, picks: [], names: mockNames(base.T, base.slot, d.live) };
@@ -942,15 +1024,17 @@ async function mockBatch(n, cfg) {
     const ctx = mockCtx(m); const byTeam = {}; m.picks.forEach(pk => (byTeam[pk.draft_slot] = byTeam[pk.draft_slot] || []).push(pk.player_id));
     const totals = Object.entries(byTeam).map(([s, ids]) => [+s, optimalLineup(ids, 'season').total]).sort((a, b) => b[1] - a[1]);
     ranks.push(totals.findIndex(t => t[0] === m.slot) + 1); starters.push(totals.find(t => t[0] === m.slot)[1]);
+    const totalsE = Object.entries(byTeam).map(([s, ids]) => [+s, optimalLineup(ids, p => p.srcSeason.espn ?? p.season).total]).sort((a, b) => b[1] - a[1]);
+    ranksE.push(totalsE.findIndex(t => t[0] === m.slot) + 1);
     S.mockBatch.done = i + 1; setStatus(`Mock batch ${i + 1}/${n}…`);
     await new Promise(r => setTimeout(r, 0));
   }
-  S.mockBatch = { running: false, n, cfg: base, byRound, avgRank: sum(ranks) / ranks.length, avgStarters: sum(starters) / starters.length, top3: ranks.filter(r => r <= 3).length / ranks.length };
+  S.mockBatch = { running: false, n, cfg: base, byRound, avgRank: sum(ranks) / ranks.length, avgRankE: sum(ranksE) / ranksE.length, avgStarters: sum(starters) / starters.length, top3: ranks.filter(r => r <= 3).length / ranks.length };
   S.sim = null; setStatus(`Mock batch done: ${n} drafts from slot ${base.slot}`); render();
 }
 function viewMock() {
   const d = mockDefaults(), m = S.mock;
-  const cfg = S.mockCfg || { T: d.T, R: d.R, type: d.type, reversal: d.reversal, slot: d.slot, tau: 3.2 };
+  const cfg = S.mockCfg || { T: d.T, R: d.R, type: d.type, reversal: d.reversal, slot: d.slot, tau: 3.2, brain: 'adp' };
   S.mockCfg = cfg;
   const setup = `<div class="card" style="margin-bottom:16px"><h2>Mock draft</h2>
     <form id="mock-form" class="toolbar" style="margin:10px 0 4px">
@@ -959,17 +1043,18 @@ function viewMock() {
       <label class="f">Your slot <input name="slot" type="number" min="1" max="${cfg.T}" value="${cfg.slot}" style="width:70px"></label>
       <label class="f">Type <select name="type"><option value="snake" ${cfg.type === 'snake' ? 'selected' : ''}>Snake</option><option value="linear" ${cfg.type === 'linear' ? 'selected' : ''}>Linear</option></select></label>
       <label class="f">3rd-round reversal <select name="reversal"><option value="0" ${!cfg.reversal ? 'selected' : ''}>Off</option><option value="3" ${cfg.reversal ? 'selected' : ''}>On</option></select></label>
-      <label class="f">Opponents <select name="tau"><option value="2" ${cfg.tau == 2 ? 'selected' : ''}>Chalk (stick to ADP)</option><option value="3.2" ${cfg.tau == 3.2 ? 'selected' : ''}>Normal</option><option value="5" ${cfg.tau == 5 ? 'selected' : ''}>Chaotic</option></select></label>
+      <label class="f">Bot brain <select name="brain"><option value="adp" ${cfg.brain === 'adp' || !cfg.brain ? 'selected' : ''}>ADP + roster needs (realistic)</option><option value="adp-pure" ${cfg.brain === 'adp-pure' ? 'selected' : ''}>ADP only</option><option value="espn" ${cfg.brain === 'espn' ? 'selected' : ''}>ESPN projections + needs</option><option value="sleeper" ${cfg.brain === 'sleeper' ? 'selected' : ''}>Sleeper projections + needs</option></select></label>
+      <label class="f">Randomness <select name="tau"><option value="2" ${cfg.tau == 2 ? 'selected' : ''}>Chalk (stick to ADP)</option><option value="3.2" ${cfg.tau == 3.2 ? 'selected' : ''}>Normal</option><option value="5" ${cfg.tau == 5 ? 'selected' : ''}>Chaotic</option></select></label>
       <button class="primary" type="submit">Start mock</button>
       <button type="button" id="mock-batch" ${S.mockBatch && S.mockBatch.running ? 'disabled' : ''}>Run 25 mocks</button>
     </form>
-    <div class="note">Uses ${S.league ? `<b>${esc(S.league.name)}</b>'s scoring and lineup slots${d.live && d.live.T === cfg.T ? ' and its draft order' : ''}` : 'the default lineup and the Scoring selector'}. Opponents pick from the ADP board weighted by what their roster still needs, the same model the draft adapter uses. "Run 25 mocks" plays full drafts taking the recommendation each time and shows who you usually land.</div></div>`;
+    <div class="note">Uses ${S.league ? `<b>${esc(S.league.name)}</b>'s scoring and lineup slots${d.live && d.live.T === cfg.T ? ' and its draft order' : ''}` : 'the default lineup and the Scoring selector'}. Bot brain sets how opponents value players: ADP mirrors real drafters; the ESPN and Sleeper brains draft off a single source, so the recommender (which blends both) is not grading its own homework. Recaps also rank every team by ESPN-only projections for the same reason. "Run 25 mocks" plays full drafts taking the recommendation each time and shows who you usually land.</div></div>`;
   let batch = '';
   const bt = S.mockBatch;
   if (bt && !bt.running) {
     const rounds = Object.keys(bt.byRound).map(Number).sort((a, b) => a - b);
     batch = `<div class="card" style="margin-bottom:16px"><h2>25-mock outlook from slot ${bt.cfg.slot}</h2>
-      <div class="tiles" style="margin:10px 0"><div class="tile"><div class="k">Avg finish (proj starters)</div><div class="v">#${f1(bt.avgRank)}</div><div class="s">of ${bt.cfg.T} teams · top-3 in ${pct(bt.top3)}</div></div><div class="tile"><div class="k">Avg starters proj</div><div class="v">${f0(bt.avgStarters)}</div><div class="s">season points</div></div></div>
+      <div class="tiles" style="margin:10px 0"><div class="tile"><div class="k">Avg finish (consensus)</div><div class="v">#${f1(bt.avgRank)}</div><div class="s">of ${bt.cfg.T} teams · top-3 in ${pct(bt.top3)}</div></div><div class="tile"><div class="k">Avg finish (ESPN-only)</div><div class="v">#${f1(bt.avgRankE)}</div><div class="s">independent grading</div></div><div class="tile"><div class="k">Avg starters proj</div><div class="v">${f0(bt.avgStarters)}</div><div class="s">season points</div></div></div>
       <div class="tablewrap"><table><thead><tr><th>Round</th><th>Pick</th><th>Who you usually get</th></tr></thead><tbody>${rounds.map(r => { const row = bt.byRound[r]; const top = Object.entries(row.counts).sort((a, b) => b[1] - a[1]).slice(0, 4); return `<tr><td class="slot">${r}</td><td class="muted">#${row.no}</td><td class="wrap">${top.map(([id, c]) => { const p = S.byId[id]; return p ? `<span class="pos ${p.pos}">${p.pos}</span> ${esc(p.name)} <span class="muted">${pct(c / bt.n)}</span>` : ''; }).join(' &nbsp;·&nbsp; ')}</td></tr>`; }).join('')}</tbody></table></div></div>`;
   } else if (bt && bt.running) batch = `<div class="card" style="margin-bottom:16px"><div class="empty">Running mock ${bt.done}/${bt.n}…</div></div>`;
   if (!m) return setup + batch;
@@ -980,7 +1065,7 @@ function viewMock() {
 function bindMock() {
   document.querySelectorAll('[data-draft]').forEach(b => b.onclick = () => mockUserPick(b.dataset.draft));
   const f = $('#mock-form');
-  const readCfg = () => { const fd = new FormData(f); const c = {}; for (const [k, v] of fd) c[k] = k === 'type' ? v : +v; S.mockCfg = { ...S.mockCfg, ...c }; return c; };
+  const readCfg = () => { const fd = new FormData(f); const c = {}; for (const [k, v] of fd) c[k] = (k === 'type' || k === 'brain') ? v : +v; S.mockCfg = { ...S.mockCfg, ...c }; return c; };
   if (f) { f.onsubmit = e => { e.preventDefault(); mockStart(readCfg()); }; const bb = $('#mock-batch'); if (bb) bb.onclick = () => { render(); mockBatch(25, readCfg()); }; }
   const a = $('#mock-auto'); if (a) a.onclick = mockAutoPick;
   const u = $('#mock-undo'); if (u) u.onclick = mockUndo;
@@ -1086,27 +1171,50 @@ function faabCard(fm) {
     ${buckets.map(b => `<tr><td><b>${b}</b> <span class="muted small">${{ starter: 'top-12 at position', flex: '13–24', bench: '25–40', dart: '41+', kdef: 'kickers & defenses' }[b]}</span></td>${phases.map(ph => cell(b + '/' + ph)).join('')}${cell(b)}</tr>`).join('')}</tbody></table></div>
     <div class="tablewrap"><table><thead><tr><th>Biggest bids</th><th>By</th><th class="r">Bid</th><th class="r">Rank</th></tr></thead><tbody>${big.map(b => `<tr><td>${esc(b.name)} <span class="muted small">${b.season} wk${b.week}</span></td><td class="small">${esc(b.team)}</td><td class="r ${b.won ? 'good' : 'muted'}">$${b.bid}${b.won ? '' : ' ✗'}</td><td class="r muted">${b.pos || ''}${b.rank || ''}</td></tr>`).join('')}</tbody></table></div></div></div>`;
 }
+/* Game state per NFL team for the selected week: pre | live | final. */
+function gameState(team) {
+  const g = (S.games || []).find(g => g.home === team || g.away === team);
+  if (!g) return 'pre';
+  return g.status === 'complete' ? 'final' : g.status === 'pre_game' ? 'pre' : 'live';
+}
+async function refreshLive() {
+  if (!S.league) return;
+  try {
+    const [games, matchups] = await Promise.all([api(`games?season=${S.state.season}&week=${S.wkNum}`), api(`sleeper/league/${S.league.league_id}/matchups/${S.wkNum}`)]);
+    S.games = games; S.matchups = matchups; S.gamesWeek = S.wkNum;
+    if (S.tab === 'matchup') render();
+  } catch (e) {}
+}
+setInterval(() => { if (S.tab === 'matchup' && S.games && S.games.some(g => g.status !== 'pre_game') && !S.games.every(g => g.status === 'complete')) refreshLive(); }, 60 * 1000);
 function viewMatchup() {
   if (!S.league || !S.myRoster) return needLeague();
+  if (!S.games || S.gamesWeek !== S.wkNum) { S.games = []; S.gamesWeek = S.wkNum; refreshLive(); }
   const mm = S.matchups.find(m => m.roster_id === S.myRoster.roster_id);
   if (!mm) return needLeague('No matchup scheduled for week ' + S.wkNum + '.');
   const opp = S.matchups.find(m => m.matchup_id === mm.matchup_id && m.roster_id !== mm.roster_id);
+  const anyLive = (S.games || []).some(g => g.status !== 'pre_game'), allDone = (S.games || []).length > 0 && S.games.every(g => g.status === 'complete');
+  /* Each starter: before kickoff = projection; in progress = points so far + half the projection
+     (progress is unknown, so half); final = points scored. Variance shrinks the same way. */
   const side = (m) => {
     const r = S.rosters.find(x => x.roster_id === m.roster_id);
     const starters = (m.starters && m.starters.length ? m.starters : r.starters || []).filter(id => id && id !== '0');
-    const ps = starters.map(id => S.byId[id]).filter(Boolean);
-    const proj = sum(ps.map(p => p.week)); const opt = optimalLineup(r.players || [], 'week');
-    const sd = Math.sqrt(sum(ps.map(p => Math.pow(0.45 * p.week, 2))));
-    return { r, ps, proj, opt, sd, actual: m.points, name: teamName(m.roster_id), starters };
+    const pp = m.players_points || {};
+    const rows = starters.map(id => { const p = S.byId[id]; if (!p) return null; const st = p.bye === S.wkNum ? 'final' : gameState(p.team); const act = pp[id] ?? 0; const exp = st === 'final' ? act : st === 'live' ? act + 0.5 * p.week : p.week; const v = st === 'final' ? 0 : st === 'live' ? Math.pow(0.35 * p.week, 2) : Math.pow(0.45 * p.week, 2); return { p, st, act, exp, v }; });
+    const exp = sum(rows.map(x => x ? x.exp : 0)), proj = sum(rows.map(x => x ? x.p.week : 0)), actual = sum(rows.map(x => x ? x.act : 0));
+    const opt = optimalLineup(r.players || [], 'week');
+    return { r, rows, exp, proj, actual, opt, sd: Math.sqrt(sum(rows.map(x => x ? x.v : 0))), name: teamName(m.roster_id), starters, points: m.points };
   };
   const A = side(mm), B = opp ? side(opp) : null;
-  const winP = B ? Phi((A.proj - B.proj) / Math.sqrt(A.sd * A.sd + B.sd * B.sd + 1)) : null;
-  const tbl = (X, mineSide) => `<div class="card"><h2>${esc(X.name)}</h2><div class="big">${f1(X.proj)} <span class="muted" style="font-size:16px">proj</span>${X.actual ? `<span class="muted" style="font-size:18px"> · ${f1(X.actual)} scored</span>` : ''}</div>
-    ${X.opt.total - X.proj > 0.5 ? `<div class="note ${mineSide ? 'warn' : 'muted'}">${mineSide ? 'You are' : 'They are'} leaving ${f1(X.opt.total - X.proj)} on the bench (optimal ${f1(X.opt.total)}).</div>` : ''}
-    <div class="tablewrap"><table><thead><tr><th>Slot</th><th>Player</th><th class="r">Opp</th><th class="r">Proj</th></tr></thead><tbody>
-    ${S.rosterPositions.filter(s => s !== 'BN').map((slot, i) => { const p = S.byId[X.starters[i]]; return `<tr><td class="slot">${slot.replace('_', ' ')}</td><td>${p ? pcell(p, { noOwner: true }) : '<span class="bad">EMPTY</span>'}</td><td class="r muted">${p ? (p.bye === S.wkNum ? '<span class="bad">BYE</span>' : esc(p.opp || '')) : ''}</td><td class="r">${p ? f1(p.week) : ''}</td></tr>`; }).join('')}
+  const winP = B ? Phi((A.exp - B.exp) / Math.sqrt(A.sd * A.sd + B.sd * B.sd + 1)) : null;
+  const chip = st => st === 'live' ? '<span class="chip live">LIVE</span>' : st === 'final' ? '<span class="chip final">final</span>' : '';
+  const tbl = (X, mineSide) => `<div class="card"><h2>${esc(X.name)}</h2>
+    <div class="big">${anyLive ? `${f1(X.actual)} <span class="muted" style="font-size:16px">scored</span> <span class="muted" style="font-size:18px">· ${f1(X.exp)} expected final</span>` : `${f1(X.proj)} <span class="muted" style="font-size:16px">proj</span>`}</div>
+    ${X.opt && X.opt.total - X.proj > 0.5 && !anyLive ? `<div class="note ${mineSide ? 'warn' : 'muted'}">${mineSide ? 'You are' : 'They are'} leaving ${f1(X.opt.total - X.proj)} on the bench (optimal ${f1(X.opt.total)}).</div>` : ''}
+    <div class="tablewrap"><table><thead><tr><th>Slot</th><th>Player</th><th class="r">Opp</th><th class="r">Proj</th>${anyLive ? '<th class="r">Now</th><th></th>' : ''}</tr></thead><tbody>
+    ${S.rosterPositions.filter(s => s !== 'BN').map((slot, i) => { const x = X.rows[i]; const p = x && x.p; return `<tr><td class="slot">${slot.replace('_', ' ')}</td><td>${p ? pcell(p, { noOwner: true }) : '<span class="bad">EMPTY</span>'}</td><td class="r muted">${p ? (p.bye === S.wkNum ? '<span class="bad">BYE</span>' : esc(p.opp || '')) : ''}</td><td class="r">${p ? f1(p.week) : ''}</td>${anyLive ? `<td class="r ${x && x.st !== 'pre' ? '' : 'muted'}">${x && x.st !== 'pre' ? f1(x.act) : ''}</td><td>${x ? chip(x.st) : ''}</td>` : ''}</tr>`; }).join('')}
     </tbody></table></div></div>`;
-  return `<div class="card" style="margin-bottom:16px"><h3>Week ${S.wkNum} win probability</h3><div class="big ${winP > .5 ? 'good' : 'bad'}">${winP == null ? '–' : pct(winP)}</div><div class="win"><i style="width:${Math.round((winP || 0) * 100)}%"></i></div><div class="note">Normal approximation from projected starters; per-player spread assumed at 45% of projection. Treat as a rough read, not a forecast.</div></div>
+  return `<div class="card" style="margin-bottom:16px"><div class="guide-head"><h3>Week ${S.wkNum} win probability ${anyLive && !allDone ? '<span class="dot live"></span><span class="live">live</span>' : allDone ? '· final' : ''}</h3><button class="tiny" id="btn-live">Refresh</button></div><div class="big ${winP > .5 ? 'good' : 'bad'}">${winP == null ? '–' : pct(winP)}</div><div class="win"><i style="width:${Math.round((winP || 0) * 100)}%"></i></div>
+    <div class="note">${anyLive ? 'Live: finished players count their actual points, players mid-game count points so far plus half their projection, everyone else their projection. Refreshes every minute while games are on.' : 'Normal approximation from projected starters; per-player spread assumed at 45% of projection. Switches to live scoring once games kick off.'}</div></div>
     <div class="vs">${tbl(A, true)}<div class="mid">VS</div>${B ? tbl(B, false) : '<div class="card"><div class="empty">Bye week</div></div>'}</div>`;
 }
 
@@ -1161,6 +1269,7 @@ function viewTrade() {
 function bindTrade() {
   const sel = $('#trade-team'); if (sel) sel.onchange = () => { S.tradeSel.team = +sel.value; S.tradeSel.theirs.clear(); render(); };
   const c = $('#trade-clear'); if (c) c.onclick = () => { S.tradeSel.mine.clear(); S.tradeSel.theirs.clear(); render(); };
+  const lv = $('#btn-live'); if (lv) lv.onclick = () => { S.games = null; render(); };
   const n = $('#btn-notify'); if (n) n.onclick = () => { if (typeof Notification === 'undefined') return; Notification.requestPermission().then(() => render()); };
   document.querySelectorAll('[data-load-trade]').forEach(b => b.onclick = () => { const t = S.trades[+b.dataset.loadTrade]; S.tradeSel.team = t.rid; S.tradeSel.mine = new Set(t.send.map(p => p.id)); S.tradeSel.theirs = new Set(t.get.map(p => p.id)); render(); window.scrollTo(0, 0); });
   document.querySelectorAll('[data-whatif]').forEach(b => b.onclick = () => { S.whatIf = S.whatIf || {}; S.whatIf[b.dataset.whatif] = waiverWhatIf(b.dataset.whatif); render(); });

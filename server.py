@@ -66,9 +66,12 @@ def players_trimmed():
             continue
         if not p.get("active") and pos != "DEF":
             continue
+        name = p.get("full_name") or (p.get("first_name", "") + " " + p.get("last_name", "")).strip()
+        if pos == "DEF":
+            name += " D/ST"
         out[pid] = {
             "id": pid,
-            "name": p.get("full_name") or (p.get("first_name", "") + " " + p.get("last_name", "")).strip(),
+            "name": name,
             "pos": pos,
             "fpos": p.get("fantasy_positions") or [pos],
             "team": p.get("team"),
@@ -479,6 +482,22 @@ def faab_history(league_id):
     return {"seasons": [lg["season"] for lg in chain], "budgets": budgets, "bids": recs}
 
 
+def player_detail(pid, season):
+    """Last season's weekly game log and this season's weekly projections for one player (raw stat lines)."""
+    prev = str(int(season) - 1)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(fetch_json, "https://api.sleeper.com/stats/nfl/player/%s?season_type=regular&season=%s&grouping=week" % (pid, prev), 6 * 3600, True)
+        f2 = ex.submit(fetch_json, "https://api.sleeper.com/projections/nfl/player/%s?season_type=regular&season=%s&grouping=week" % (pid, season), 3600, True)
+        log, proj = f1.result(), f2.result()
+    trim = lambda d: {w: {"opp": v.get("opponent"), "date": v.get("date"), "stats": v.get("stats") or {}} for w, v in (d or {}).items() if v}
+    return {"prev_season": prev, "log": trim(log), "proj": trim(proj)}
+
+
+def games(season, week):
+    data = fetch_json("https://api.sleeper.app/schedule/nfl/regular/%s" % season, ttl=60, disk=False)
+    return [g for g in data if str(g.get("week")) == str(week)]
+
+
 def adp(fmt, teams):
     fmt = {"ppr": "ppr", "half": "half-ppr", "half-ppr": "half-ppr", "std": "standard",
            "standard": "standard", "2qb": "2qb"}.get(fmt, "ppr")
@@ -550,6 +569,10 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "trending":
                 return self.send_json(sleeper_v1(
                     f"players/nfl/trending/{q.get('type','add')}?lookback_hours={q.get('hours','48')}&limit=100", ttl=900))
+            if path == "games":
+                return self.send_json(games(q.get("season", "2026"), q.get("week", "1")))
+            if path.startswith("player/"):
+                return self.send_json(player_detail(path.split("/")[1], q.get("season", "2026")))
             if path == "accuracy":
                 return self.send_json(accuracy(q.get("season", "2026")))
             if path == "schedule":
