@@ -562,6 +562,7 @@ async function loadLeague() {
   setStatus('Loading league…');
   const id = S.leagueId;
   const [league, rosters, users] = await Promise.all([api('sleeper/league/' + id), api(`sleeper/league/${id}/rosters`), api(`sleeper/league/${id}/users`)]);
+  if (S.replay && S.replay !== 'keep') { api('replay/stop').catch(() => {}); S.replay = null; }
   S.league = league; S.rosters = rosters; S.users = users; S.mockCfg = null; S.mockBatch = null; S.mock = null; S.whatIf = null; S.accuracy = null; S.keeperPrev = null; S.keeperCost = {}; S.tend = null; S.teamHist = null; S.picksLoaded = null; S.bracket = null; S.exposure = null; S.tradeSel = { mine: new Set(), theirs: new Set(), team: null, picksMine: new Set(), picksTheirs: new Set() };
   S.scoring = league.scoring_settings; S.rosterPositions = league.roster_positions.filter(s => s !== 'IDP_FLEX' && !/^(DL|LB|DB|IDP)/.test(s)); S.teams = league.total_rosters;
   S.myRoster = S.user ? rosters.find(r => r.owner_id === S.user.user_id || (r.co_owners || []).includes(S.user.user_id)) : null;
@@ -575,22 +576,50 @@ async function loadLeague() {
   rebuildPlayers(); render();
   setStatus(`${S.teams} teams · ${S.adpFmt.toUpperCase()} ADP · ${S.myRoster ? 'you are ' + teamName(S.myRoster.roster_id) : 'not a member'}`);
   updateCtx(); if (window.innerWidth <= 760) closeSheets();
-  if (S.draft && S.draft.status !== 'complete') S.pollTimer = setInterval(pollDraft, S.draft.status === 'drafting' ? 6000 : 20000);
+  startPolling();
+}
+/* Poll every 3 s while drafting (Sleeper clocks are 30–90 s), every 10 s before the draft, and
+   immediately when the tab regains focus. */
+function startPolling() {
+  clearInterval(S.pollTimer); S.pollTimer = null;
+  if (!S.draft || S.draft.status === 'complete') return;
+  S.pollTimer = setInterval(pollDraft, S.draft.status === 'drafting' ? 3000 : 10000);
 }
 async function pollDraft() {
+  if (!S.draft || S.polling) return;
+  S.polling = true;
   try {
     if (S.draft.status !== 'drafting') {
       const d = await api('sleeper/draft/' + S.draft.draft_id);
+      S.lastPoll = Date.now(); S.pollErr = null;
       if (d.status !== S.draft.status || JSON.stringify(d.draft_order) !== JSON.stringify(S.draft.draft_order)) {
-        S.draft = d; render();
-        if (d.status === 'drafting') { clearInterval(S.pollTimer); S.pollTimer = setInterval(pollDraft, 6000); }
+        S.draft = d; if (d.status === 'drafting') { S.picks = await api(`sleeper/draft/${d.draft_id}/picks`).catch(() => S.picks); startPolling(); }
+        render();
       }
-      return;
+    } else {
+      const [picks, d] = await Promise.all([api(`sleeper/draft/${S.draft.draft_id}/picks`), api('sleeper/draft/' + S.draft.draft_id).catch(() => null)]);
+      S.lastPoll = Date.now(); S.pollErr = null;
+      if (d) { S.draft.last_picked = d.last_picked; if (d.status !== S.draft.status) { S.draft = d; startPolling(); } }
+      if (picks.length !== S.picks.length) { S.picks = picks; if (S.tab === 'draft') render(); }
+      if (picks.length >= (S.draft.settings.teams * S.draft.settings.rounds)) { S.draft = await api('sleeper/draft/' + S.draft.draft_id); startPolling(); render(); }
     }
-    const picks = await api(`sleeper/draft/${S.draft.draft_id}/picks`);
-    if (picks.length !== S.picks.length) { S.picks = picks; if (S.tab === 'draft') render(); }
-    if (picks.length >= (S.draft.settings.teams * S.draft.settings.rounds)) { clearInterval(S.pollTimer); S.draft = await api('sleeper/draft/' + S.draft.draft_id); render(); }
-  } catch (e) {}
+  } catch (e) { S.pollErr = e.message; }
+  S.polling = false;
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.draft && S.draft.status !== 'complete') pollDraft(); });
+/* ---------- rehearsal: replay last season's draft through the live code path ---------- */
+async function startRehearsal(interval) {
+  const prev = S.league && S.league.previous_league_id; if (!prev) { setStatus('No previous season to replay', true); return; }
+  const drafts = await api('sleeper/league/' + prev + '/drafts');
+  const d = drafts.find(x => x.status === 'complete'); if (!d) { setStatus('Last season has no completed draft', true); return; }
+  const slot = d.draft_order && S.user ? d.draft_order[S.user.user_id] : null;
+  await api(`replay/start?draft_id=${d.draft_id}&interval=${interval}&pre=15${slot ? '&slot=' + slot : ''}`);
+  S.replay = d.draft_id; S.draft = await api('sleeper/draft/' + d.draft_id); S.picks = []; S.sim = null; _wasOnClock = false;
+  startPolling(); render();
+}
+async function stopRehearsal() {
+  await api('replay/stop').catch(() => {}); S.replay = null;
+  await loadLeague();
 }
 /* ---------- live draft adapter: Monte Carlo of the picks before yours ----------
    Each other team picks from the top of the ADP board with probability decaying by ADP rank,
@@ -1096,7 +1125,9 @@ let _audio = null;
 function beep() { try { _audio = _audio || new (window.AudioContext || window.webkitAudioContext)(); const o = _audio.createOscillator(), g = _audio.createGain(); o.frequency.value = 880; o.connect(g); g.connect(_audio.destination); g.gain.setValueAtTime(0.2, _audio.currentTime); g.gain.exponentialRampToValueAtTime(0.001, _audio.currentTime + 0.6); o.start(); o.stop(_audio.currentTime + 0.6); } catch (e) {} }
 let _wasOnClock = false;
 function pickTimerText() { const d = S.draft; if (!d || d.status !== 'drafting' || !d.settings || !d.settings.pick_timer || !d.last_picked) return ''; const left = Math.round(d.settings.pick_timer - (Date.now() - d.last_picked) / 1000); return left > 0 ? `${left}s left` : 'time up'; }
-setInterval(() => { const el = $('#pick-timer'); if (el) el.textContent = pickTimerText(); }, 1000);
+function countdownText() { const d = S.draft; if (!d || d.status !== 'pre_draft' || !d.start_time) return ''; const s = Math.round((d.start_time - Date.now()) / 1000); if (s <= 0) return 'starting…'; const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60), ss = s % 60; return hh ? `starts in ${hh}h ${mm}m` : `starts in ${mm}m ${ss}s`; }
+function pollAgeText() { if (!S.draft || S.draft.status === 'complete' || !S.lastPoll) return ''; const s = Math.round((Date.now() - S.lastPoll) / 1000); return S.pollErr ? `⚠ feed error: ${S.pollErr}` : (s > 15 && S.draft.status === 'drafting') ? `⚠ feed stale ${s}s` : `updated ${s}s ago`; }
+setInterval(() => { const el = $('#pick-timer'); if (el) el.textContent = pickTimerText(); const c = $('#countdown'); if (c) c.textContent = countdownText(); const a = $('#poll-age'); if (a) { a.textContent = pollAgeText(); a.className = a.textContent.startsWith('⚠') ? 'bad small' : 'faint small'; } }, 1000);
 function renderDraft(B) {
   const { ctx, picks, nextPickNo, myNext, myNext2, myPicked, have, fixed, flex, R, round, sim } = B;
   const queue = getQueue(ctx), queued = B.rows.filter(p => queue.has(p.id));
@@ -1113,8 +1144,8 @@ function renderDraft(B) {
   const pickStrip = ctx && ctx.slot ? `<div class="pick-list">${mine.map(p => `<span class="${p.no < nextPickNo ? 'done' : (myNext && p.no === myNext.no ? 'next' : '')}" title="Round ${p.round}">${p.round}.${String(p.no - (p.round - 1) * ctx.T).padStart(2, '0')} · #${p.no}</span>`).join('')}</div>` : '';
   const onClock = drafting ? ctx.nameOf(slotAtPick(nextPickNo, ctx.T, ctx.type, ctx.reversal)) : null;
   const tiles = `<div class="tiles">
-    <div class="tile"><div class="k">Draft</div><div class="v">${ctx ? (isMock ? 'mock' : esc(ctx.status.replace('_', ' '))) : 'no league'}</div><div class="s">${ctx ? `${ctx.type} · ${ctx.T} teams · ${R} rounds${ctx.reversal ? ' · 3RR' : ''}` : 'default 12-team board'}</div></div>
-    <div class="tile"><div class="k">On the clock ${ctx && ctx.kind === 'live' ? `<button class="tiny" id="btn-beep" title="Play a sound when you are on the clock">${LS.get('beep', true) ? '🔔 on' : '🔕 off'}</button>` : ''}</div><div class="v">${drafting ? `<span class="dot live"></span>#${nextPickNo}` : done ? 'Done' : '–'}</div><div class="s">${onClock ? esc(onClock) + (B.onClock ? ' — YOU' : '') : (ctx ? 'round ' + round : '')} <span id="pick-timer" class="${B.onClock ? 'warn' : 'muted'}">${pickTimerText()}</span></div></div>
+    <div class="tile"><div class="k">Draft${S.replay && !isMock ? ' <span class="chip warn">rehearsal</span>' : ''}</div><div class="v">${ctx ? (isMock ? 'mock' : esc(ctx.status.replace('_', ' '))) : 'no league'}</div><div class="s">${ctx ? `${ctx.type} · ${ctx.T} teams · ${R} rounds${ctx.reversal ? ' · 3RR' : ''}` : 'default 12-team board'}${!isMock && S.draft && S.draft.status === 'pre_draft' && S.draft.start_time ? ` · <span id="countdown">${countdownText()}</span>` : ''}</div></div>
+    <div class="tile"><div class="k">On the clock ${ctx && ctx.kind === 'live' ? `<button class="tiny" id="btn-beep" title="Play a sound when you are on the clock">${LS.get('beep', true) ? '🔔 on' : '🔕 off'}</button>` : ''}</div><div class="v">${drafting ? `<span class="dot live"></span>#${nextPickNo}` : done ? 'Done' : '–'}</div><div class="s">${onClock ? esc(onClock) + (B.onClock ? ' — YOU' : '') : (ctx ? 'round ' + round : '')} <span id="pick-timer" class="${B.onClock ? 'warn' : 'muted'}">${pickTimerText()}</span>${!isMock ? ` <span id="poll-age" class="faint small">${pollAgeText()}</span>` : ''}</div></div>
     <div class="tile"><div class="k">My next pick</div><div class="v">${myNext ? '#' + myNext.no : (ctx && !ctx.slot ? 'slot TBD' : '–')}</div><div class="s">${myNext ? `round ${myNext.round}${myNext2 ? ` · then #${myNext2.no}` : ''}` : ''}</div></div>
     <div class="tile"><div class="k">My roster</div><div class="v">${myPicked.length}<span class="muted" style="font-size:16px">/${R}</span></div><div class="s">${POS.map(p => `${p} ${have[p] || 0}`).join(' · ')}</div></div>
     <div class="tile"><div class="k">ADP source</div><div class="v">${S.adpFmt.toUpperCase()}</div><div class="s">Sleeper + FFC ${S.adpMeta ? `(${S.adpMeta.total_drafts} drafts)` : ''}</div></div>
@@ -1149,7 +1180,26 @@ function renderDraft(B) {
     <div class="note">Proj = full-season points in ${S.league ? 'this league\'s scoring' : $('#scoring-select').selectedOptions[0].text} (Sleeper/Rotowire). VORP = points over replacement at position given ${S.teams} teams and your lineup slots. "To you" = what he adds to your lineup (full VORP for an empty slot, the upgrade if he displaces a starter, a fraction if he would sit on your bench). "vs pick" = ADP minus the current pick (negative = value, +12 or more = reach).</div></div>`;
   let recap = '';
   if (done && picks.length) recap = draftRecap(ctx);
-  return tiles + (pickStrip ? `<div class="card" style="margin-bottom:16px"><h3>My pick slots (slot ${ctx.slot})</h3>${pickStrip}</div>` : '') + guidanceCard(B) + toolbar() + `<div class="grid side"><div>${table}${recap}</div><div style="display:grid;gap:16px;align-content:start">${queueBox}${suggBox}${adapterBox}${mineBox}${recentBox}</div></div>`;
+  let preflight = '';
+  if (ctx && ctx.kind === 'live' && ctx.status !== 'complete') {
+    const d = S.draft, ok = (c, good, bad) => `<li class="${c ? 'good' : 'warn'}">${c ? '✓' : '✗'} ${c ? good : bad}</li>`;
+    const notif = typeof Notification !== 'undefined' && Notification.permission === 'granted';
+    preflight = `<div class="card" style="margin-bottom:16px"><div class="guide-head"><h3>Draft-day pre-flight</h3><span class="mact">${S.replay ? `<button class="tiny" id="btn-stop-rehearsal">Stop rehearsal</button>` : `<select id="rehearse-speed" style="min-height:28px;padding:2px 8px"><option value="8">8 s per pick</option><option value="4">4 s per pick</option><option value="2">2 s per pick</option><option value="30">30 s (realistic)</option></select><button class="tiny primary" id="btn-rehearse" title="Replays last season's real draft through the live code: picks stream in, the timer runs, the bell rings when your slot is up">Rehearse with last season's draft</button>`}</span></div>
+      <ul class="why" style="columns:2;column-gap:24px">
+        ${ok(!!ctx.slot, `Draft slot ${ctx.slot} of ${ctx.T} (${ctx.type}${ctx.reversal ? ', 3rd-round reversal' : ''}, ${ctx.R} rounds)`, 'Your draft slot is not set yet; the board still works, availability odds appear once Sleeper assigns slots')}
+        ${ok(d.settings && d.settings.pick_timer, `Pick clock ${d.settings && d.settings.pick_timer}s; this page polls every 3 s while drafting`, 'No pick clock reported')}
+        ${ok(S.adpMeta && S.adpMeta.total_drafts > 0, `ADP loaded (${S.adpFmt.toUpperCase()}, ${S.adpMeta ? S.adpMeta.total_drafts : 0} FFC drafts + Sleeper)`, 'ADP failed to load; availability odds fall back to Sleeper ADP only')}
+        ${ok(S.matrix && S.matrix.espn_ok, 'Consensus projections on (Sleeper + ESPN)', 'ESPN projections unavailable; Sleeper only')}
+        ${ok(S.scoring, `League scoring applied (${S.scoring && S.scoring.rec >= 1 ? 'PPR' : S.scoring && S.scoring.rec >= 0.5 ? 'half PPR' : 'standard'}${slotCounts(S.rosterPositions).flex.some(el => el.includes('QB')) ? ', superflex' : ''})`, 'No league scoring loaded')}
+        ${ok(notif, 'Desktop notifications on', 'Desktop notifications off (enable on My Team)')}
+        ${ok(LS.get('beep', true), 'On-the-clock bell on', 'Bell is off')}
+        ${ok(queued.length > 0, `${queued.length} player${queued.length > 1 ? 's' : ''} queued`, 'Queue empty: star a few targets so they show first with survival odds')}
+        ${ok(S.picks.some(pk => pk.is_keeper) || !(S.league.settings.max_keepers), S.picks.some(pk => pk.is_keeper) ? `${S.picks.filter(pk => pk.is_keeper).length} keeper pick${S.picks.filter(pk => pk.is_keeper).length > 1 ? 's' : ''} already on the board` : 'No keepers in this league', 'Keepers not on the board yet; they appear when Sleeper locks them')}
+      </ul>
+      ${S.replay ? '<div class="note warn">Rehearsal running: last season\'s real picks stream in on a timer; when your slot comes up the historical pick is made for you after the clock. Use it to get familiar with the guidance, queue, timer and bell. Stop to return to your real draft.</div>' : '<div class="note">Tip: keep this tab open in its own window next to Sleeper. Picks refresh every 3 s; the feed indicator in the "On the clock" tile turns red if the connection goes stale.</div>'}
+    </div>` + planCard();
+  }
+  return tiles + preflight + (pickStrip ? `<div class="card" style="margin-bottom:16px"><h3>My pick slots (slot ${ctx.slot})</h3>${pickStrip}</div>` : '') + guidanceCard(B) + toolbar() + `<div class="grid side"><div>${table}${recap}</div><div style="display:grid;gap:16px;align-content:start">${queueBox}${suggBox}${adapterBox}${mineBox}${recentBox}</div></div>`;
 }
 function draftRecap(ctx) {
   const byTeam = {}; ctx.picks.forEach(pk => { const k = ctx.keyOf(pk); (byTeam[k] = byTeam[k] || []).push(pk); });
@@ -1243,11 +1293,21 @@ async function mockBatch(n, cfg) {
     ranks.push(totals.findIndex(t => t[0] === m.slot) + 1); starters.push(totals.find(t => t[0] === m.slot)[1]);
     const totalsE = Object.entries(byTeam).map(([s, ids]) => [+s, optimalLineup(ids, p => p.srcSeason.espn ?? p.season).total]).sort((a, b) => b[1] - a[1]);
     ranksE.push(totalsE.findIndex(t => t[0] === m.slot) + 1);
-    S.mockBatch.done = i + 1; setStatus(`Mock batch ${i + 1}/${n}…`);
+    S.mockBatch.done = i + 1; setStatus(`Mock batch ${i + 1}/${n}…`); if (S.tab === 'draft' && i % 5 === 4) render();
     await new Promise(r => setTimeout(r, 0));
   }
   S.mockBatch = { running: false, n, cfg: base, byRound, avgRank: sum(ranks) / ranks.length, avgRankE: sum(ranksE) / ranksE.length, avgStarters: sum(starters) / starters.length, top3: ranks.filter(r => r <= 3).length / ranks.length };
   S.sim = null; setStatus(`Mock batch done: ${n} drafts from slot ${base.slot}`); render();
+}
+function batchOutlookTable(bt) {
+  const rounds = Object.keys(bt.byRound).map(Number).sort((a, b) => a - b);
+  return `<div class="tiles" style="margin:10px 0"><div class="tile"><div class="k">Avg finish (consensus)</div><div class="v">#${f1(bt.avgRank)}</div><div class="s">of ${bt.cfg.T} teams · top-3 in ${pct(bt.top3)}</div></div><div class="tile"><div class="k">Avg finish (ESPN-only)</div><div class="v">#${f1(bt.avgRankE)}</div><div class="s">independent grading</div></div><div class="tile"><div class="k">Avg starters proj</div><div class="v">${f0(bt.avgStarters)}</div><div class="s">season points</div></div></div>
+      <div class="tablewrap"><table><thead><tr><th>Round</th><th>Pick</th><th>Who you usually get</th></tr></thead><tbody>${rounds.map(r => { const row = bt.byRound[r]; const top = Object.entries(row.counts).sort((a, b) => b[1] - a[1]).slice(0, 4); return `<tr><td class="slot">${r}</td><td class="muted">#${row.no}</td><td class="wrap">${top.map(([id, c]) => { const p = S.byId[id]; return p ? `<span class="pos ${p.pos}">${p.pos}</span> ${esc(p.name)} <span class="muted">${pct(c / bt.n)}</span>` : ''; }).join(' &nbsp;·&nbsp; ')}</td></tr>`; }).join('')}</tbody></table></div>`;
+}
+function planCard() {
+  const bt = S.mockBatch;
+  return `<div class="card" style="margin-bottom:16px"><div class="guide-head"><h3>Draft plan from your slot</h3><button class="tiny ${bt && !bt.running ? '' : 'primary'}" id="btn-plan" ${bt && bt.running ? 'disabled' : ''}>${bt && bt.running ? `Running ${bt.done}/${bt.n}…` : bt ? 'Rebuild (25 mocks)' : 'Build plan (25 mocks)'}</button></div>
+    ${bt && !bt.running ? batchOutlookTable(bt) + '<div class="note">Who you usually land in each round when opponents draft by ADP and needs and you take the recommendation. Treat the top name in each round as the target and the others as the fallback list.</div>' : '<div class="note">Plays 25 full mock drafts from your real slot with this league\'s settings and shows the players you most often land in each round.</div>'}</div>`;
 }
 function viewMock() {
   const d = mockDefaults(), m = S.mock;
@@ -1269,10 +1329,7 @@ function viewMock() {
   let batch = '';
   const bt = S.mockBatch;
   if (bt && !bt.running) {
-    const rounds = Object.keys(bt.byRound).map(Number).sort((a, b) => a - b);
-    batch = `<div class="card" style="margin-bottom:16px"><h2>25-mock outlook from slot ${bt.cfg.slot}</h2>
-      <div class="tiles" style="margin:10px 0"><div class="tile"><div class="k">Avg finish (consensus)</div><div class="v">#${f1(bt.avgRank)}</div><div class="s">of ${bt.cfg.T} teams · top-3 in ${pct(bt.top3)}</div></div><div class="tile"><div class="k">Avg finish (ESPN-only)</div><div class="v">#${f1(bt.avgRankE)}</div><div class="s">independent grading</div></div><div class="tile"><div class="k">Avg starters proj</div><div class="v">${f0(bt.avgStarters)}</div><div class="s">season points</div></div></div>
-      <div class="tablewrap"><table><thead><tr><th>Round</th><th>Pick</th><th>Who you usually get</th></tr></thead><tbody>${rounds.map(r => { const row = bt.byRound[r]; const top = Object.entries(row.counts).sort((a, b) => b[1] - a[1]).slice(0, 4); return `<tr><td class="slot">${r}</td><td class="muted">#${row.no}</td><td class="wrap">${top.map(([id, c]) => { const p = S.byId[id]; return p ? `<span class="pos ${p.pos}">${p.pos}</span> ${esc(p.name)} <span class="muted">${pct(c / bt.n)}</span>` : ''; }).join(' &nbsp;·&nbsp; ')}</td></tr>`; }).join('')}</tbody></table></div></div>`;
+    batch = `<div class="card" style="margin-bottom:16px"><h2>25-mock outlook from slot ${bt.cfg.slot}</h2>${batchOutlookTable(bt)}</div>`;
   } else if (bt && bt.running) batch = `<div class="card" style="margin-bottom:16px"><div class="empty">Running mock ${bt.done}/${bt.n}…</div></div>`;
   if (!m) return setup + batch;
   const B = scoreBoard(mockCtx(m));
@@ -1282,6 +1339,9 @@ function viewMock() {
 function bindMock() {
   document.querySelectorAll('[data-draft]').forEach(b => b.onclick = () => mockUserPick(b.dataset.draft));
   document.querySelectorAll('[data-queue]').forEach(b => b.onclick = () => { toggleQueue(S.tab === 'mock' ? mockCtx() : liveCtx(), b.dataset.queue); render(); });
+  const rh = $('#btn-rehearse'); if (rh) rh.onclick = () => { rh.disabled = true; rh.textContent = 'Starting…'; startRehearsal(+($('#rehearse-speed').value || 8)).catch(e => setStatus('Rehearsal failed: ' + e.message, true)); };
+  const sr = $('#btn-stop-rehearsal'); if (sr) sr.onclick = () => stopRehearsal();
+  const pl = $('#btn-plan'); if (pl) pl.onclick = () => { const d = mockDefaults(); render(); mockBatch(25, { T: d.T, R: d.R, type: d.type, reversal: d.reversal, slot: d.slot, tau: 3.2, brain: 'adp' }); };
   const bp = $('#btn-beep'); if (bp) bp.onclick = () => { LS.set('beep', !LS.get('beep', true)); render(); };
   const f = $('#mock-form');
   const readCfg = () => { const fd = new FormData(f); const c = {}; for (const [k, v] of fd) c[k] = (k === 'type' || k === 'brain') ? v : +v; S.mockCfg = { ...S.mockCfg, ...c }; return c; };

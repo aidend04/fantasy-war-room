@@ -76,6 +76,17 @@ rankings render as cards instead of wide tables; other tables scroll sideways in
 (username, league, week, value basis, Vegas, scoring, theme) live in a slide-in sheet on every size. Dark and
 light themes follow the system by default and can be forced in Settings.
 
+## Draft day
+
+The Draft tab shows a pre-flight checklist before your draft (slot, clock, ADP, consensus, notifications, bell,
+queue, keepers) and a countdown to the start. **Rehearse with last season's draft** replays your league's
+previous real draft through the live code path at a speed you choose: picks stream in, the pick clock runs,
+the bell rings when your slot is up, and the guidance updates every pick. Stop it to return to the real draft.
+**Build plan** runs 25 mocks from your real slot and lists who you usually land in each round.
+
+During the draft the page polls every 3 seconds, refreshes immediately when the tab regains focus, and shows a
+"feed stale" warning in the On the clock tile if Sleeper stops answering.
+
 ## Game-day alerts from cron
 
 `alerts.py` checks your starters without the browser: injury status, byes, low projections and the best

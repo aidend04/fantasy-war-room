@@ -52,7 +52,50 @@ def fetch_json(url, ttl=60, disk=False):
     return data
 
 
+REPLAY = {}
+
+
+def replay_start(draft_id, interval, pre, slot=None):
+    """Rehearsal: replay a completed Sleeper draft as if it were live. The proxy then serves the
+    draft object as pre_draft -> drafting -> complete and releases one historical pick per interval."""
+    d = fetch_json("https://api.sleeper.app/v1/draft/%s" % draft_id, ttl=3600)
+    picks = fetch_json("https://api.sleeper.app/v1/draft/%s/picks" % draft_id, ttl=3600)
+    REPLAY.clear()
+    picks = sorted(picks, key=lambda p: p["pick_no"])
+    interval, pre = float(interval), float(pre)
+    hold = interval * 3  # the user's own picks stay on the clock longer so the guidance can be studied
+    t, release = time.time() + pre, []
+    for pk in picks:
+        t += hold if slot and str(pk.get("draft_slot")) == str(slot) else interval
+        release.append(t)
+    REPLAY.clear()
+    REPLAY.update({"draft_id": str(draft_id), "draft": d, "picks": picks, "start": time.time(), "interval": interval, "pre": pre, "hold": hold, "slot": slot, "release": release})
+    return replay_view()
+
+
+def replay_view():
+    r = REPLAY
+    if not r:
+        return None
+    now = time.time(); t0 = r["start"] + r["pre"]
+    n = sum(1 for t in r["release"] if t <= now)
+    d = dict(r["draft"])
+    d["status"] = "pre_draft" if now < t0 else ("complete" if n >= len(r["picks"]) else "drafting")
+    d["start_time"] = int(t0 * 1000)
+    d["last_picked"] = int(r["release"][n - 1] * 1000) if n else int(t0 * 1000)
+    nxt = r["picks"][n] if n < len(r["picks"]) else None
+    d["settings"] = dict(d.get("settings") or {}); d["settings"]["pick_timer"] = int(r["hold"] if nxt and r["slot"] and str(nxt.get("draft_slot")) == str(r["slot"]) else r["interval"])
+    d["replay"] = True
+    return {"draft": d, "picks": r["picks"][:n], "released": n, "total": len(r["picks"])}
+
+
 def sleeper_v1(path, ttl=60):
+    if REPLAY:
+        v = replay_view(); did = REPLAY["draft_id"]
+        if path == "draft/%s" % did:
+            return v["draft"]
+        if path == "draft/%s/picks" % did:
+            return v["picks"]
     return fetch_json("https://api.sleeper.app/v1/" + path.lstrip("/"), ttl=ttl)
 
 
@@ -856,6 +899,12 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "trending":
                 return self.send_json(sleeper_v1(
                     f"players/nfl/trending/{q.get('type','add')}?lookback_hours={q.get('hours','48')}&limit=100", ttl=900))
+            if path == "replay/start":
+                return self.send_json(replay_start(q["draft_id"], q.get("interval", "8"), q.get("pre", "20"), q.get("slot")))
+            if path == "replay/stop":
+                REPLAY.clear(); return self.send_json({"ok": True})
+            if path == "replay/status":
+                return self.send_json(replay_view() or {"active": False})
             if path == "news":
                 return self.send_json(news(int(q.get("limit", "100"))))
             if path == "usage":
